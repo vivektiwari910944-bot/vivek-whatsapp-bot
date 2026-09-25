@@ -1,28 +1,22 @@
-FROM node:20-bullseye-slim
+FROM node:20-alpine
 
-# System dependencies install karo
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
+# Python & System dependencies install
+RUN apk add --no-舆-cache python3 py3-pip procps
 
 WORKDIR /app
 
-# Copy package files
+# Copy dependency files
 COPY package*.json ./
-
-# Clean NPM install setup
-RUN npm cache clean --force && npm install --production
-
-# Python requirements install karo
 COPY requirements.txt ./
-RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Baaki saari files copy karo
+# Fast and clean package installation
+RUN npm install --omit=dev
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+
+# Copy source files
 COPY . .
 
 EXPOSE 5000 4000
 
-# Engine aur Flask UI ek sath start karne ke liye
+# Start Engine and Flask Server
 CMD node index.js & python3 app.py
