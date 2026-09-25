@@ -11,6 +11,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
+import path from 'path';
 import express from 'express';
 
 const app = express();
@@ -25,8 +26,10 @@ const pairingCodes = new Map();
 const targetAutoReplies = new Map();
 const messageStore = new Map();
 const processedMessages = new Set();
+const startingSessions = new Set();
+const reconnectTimers = new Map();
 
-const SESSIONS_BASE = './sessions';
+const SESSIONS_BASE = process.env.SESSIONS_DIR || './sessions';
 if (!fs.existsSync(SESSIONS_BASE)) fs.mkdirSync(SESSIONS_BASE, { recursive: true });
 
 const getUptime = () => {
@@ -37,72 +40,146 @@ const getUptime = () => {
     return `${hours}h ${minutes}m ${seconds}s`;
 };
 
-async function startSession(phoneNumber) {
-    const cleanedNumber = phoneNumber.replace(/[^0-9]/g, '');
+const sessionPathFor = (phone) => path.join(SESSIONS_BASE, phone);
+
+function clearReconnectTimer(phone) {
+    const timer = reconnectTimers.get(phone);
+    if (timer) {
+        clearTimeout(timer);
+        reconnectTimers.delete(phone);
+    }
+}
+
+async function closeSocket(phone, sock) {
+    try {
+        sock.ev.removeAllListeners();
+    } catch (e) {}
+
+    try {
+        if (sock.ws && sock.ws.readyState === 1) sock.ws.close();
+    } catch (e) {}
+
+    if (activeSockets.get(phone) === sock) {
+        activeSockets.delete(phone);
+    }
+}
+
+async function startSession(phoneNumber, options = {}) {
+    const cleanedNumber = String(phoneNumber || '').replace(/[^0-9]/g, '');
     if (!cleanedNumber) return { success: false, error: 'Invalid Phone Number' };
 
-    const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
-
-    if (activeSockets.has(cleanedNumber)) {
-        try {
-            const oldSock = activeSockets.get(cleanedNumber);
-            oldSock.ev.removeAllListeners();
-            oldSock.end(undefined);
-            activeSockets.delete(cleanedNumber);
-        } catch (e) {}
+    // Never create two Baileys sockets for the same WhatsApp account.
+    const existing = activeSockets.get(cleanedNumber);
+    if (existing) {
+        return {
+            success: true,
+            code: pairingCodes.get(cleanedNumber) || null,
+            alreadyRunning: true
+        };
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-        auth: state,
-        version,
-        logger: pino({ level: 'silent' }),
-        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Updated Browser Config for Linking Fix
-        printQRInTerminal: false,
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 30000,
-        syncFullHistory: false
-    });
-
-    activeSockets.set(cleanedNumber, sock);
-
-    let generatedCode = null;
-
-    if (!sock.authState.creds.registered) {
-        try {
-            // Delay for socket initialization to prevent "Couldn't link device"
-            await new Promise((resolve) => setTimeout(resolve, 4000));
-            generatedCode = await sock.requestPairingCode(cleanedNumber);
-            pairingCodes.set(cleanedNumber, generatedCode);
-            console.log(`[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`);
-        } catch (err) {
-            console.error(`Pairing Error (${cleanedNumber}):`, err);
-            fs.rmSync(sessionPath, { recursive: true, force: true });
-            return { success: false, error: 'Pairing code generation failed. Try again.' };
-        }
+    if (startingSessions.has(cleanedNumber)) {
+        return {
+            success: true,
+            code: pairingCodes.get(cleanedNumber) || null,
+            starting: true
+        };
     }
 
-    sock.ev.on('creds.update', saveCreds);
+    startingSessions.add(cleanedNumber);
+    clearReconnectTimer(cleanedNumber);
 
-    sock.ev.on('connection.update', async (upd) => {
-        const { connection, lastDisconnect } = upd;
-        if (connection === 'close') {
-            const statusCode = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : 500;
-            pairingCodes.delete(cleanedNumber);
-            
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                activeSockets.delete(cleanedNumber);
-                fs.rmSync(sessionPath, { recursive: true, force: true });
-            } else {
-                setTimeout(() => startSession(cleanedNumber), 3000);
+    const sessionPath = sessionPathFor(cleanedNumber);
+
+    try {
+        fs.mkdirSync(sessionPath, { recursive: true });
+
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        const { version } = await fetchLatestBaileysVersion();
+
+        const sock = makeWASocket({
+            auth: state,
+            version,
+            logger: pino({ level: 'silent' }),
+            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            printQRInTerminal: false,
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
+            markOnlineOnConnect: false,
+            syncFullHistory: false,
+            emitOwnEvents: true
+        });
+
+        activeSockets.set(cleanedNumber, sock);
+
+        let generatedCode = null;
+
+        if (!sock.authState.creds.registered) {
+            try {
+                await new Promise((resolve) => setTimeout(resolve, 4000));
+
+                if (activeSockets.get(cleanedNumber) !== sock) {
+                    throw new Error('Session socket was replaced before pairing.');
+                }
+
+                generatedCode = await sock.requestPairingCode(cleanedNumber);
+                pairingCodes.set(cleanedNumber, generatedCode);
+                console.log(`[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`);
+            } catch (err) {
+                console.error(`Pairing Error (${cleanedNumber}):`, err);
+                await closeSocket(cleanedNumber, sock);
+                if (options.resetOnPairingError) {
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                }
+                startingSessions.delete(cleanedNumber);
+                return { success: false, error: 'Pairing code generation failed. Try again.' };
             }
-        } else if (connection === 'open') {
-            pairingCodes.delete(cleanedNumber);
-            console.log(`✅ Session Active: ${cleanedNumber}`);
         }
-    });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('connection.update', async (upd) => {
+            const { connection, lastDisconnect } = upd;
+
+            if (connection === 'open') {
+                pairingCodes.delete(cleanedNumber);
+                startingSessions.delete(cleanedNumber);
+                console.log(`✅ Session Active: ${cleanedNumber}`);
+                return;
+            }
+
+            if (connection !== 'close') return;
+
+            const statusCode =
+                lastDisconnect?.error instanceof Boom
+                    ? lastDisconnect.error.output.statusCode
+                    : 500;
+
+            pairingCodes.delete(cleanedNumber);
+
+            // An old socket must never delete/restart a newer socket.
+            if (activeSockets.get(cleanedNumber) !== sock) return;
+
+            activeSockets.delete(cleanedNumber);
+            startingSessions.delete(cleanedNumber);
+
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                console.log(`🔴 Logged out: ${cleanedNumber}`);
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+                return;
+            }
+
+            // Reconnect without deleting credentials. This preserves Signal keys.
+            if (!reconnectTimers.has(cleanedNumber)) {
+                const timer = setTimeout(() => {
+                    reconnectTimers.delete(cleanedNumber);
+                    startSession(cleanedNumber).catch((err) =>
+                        console.error(`Reconnect Error (${cleanedNumber}):`, err)
+                    );
+                }, 5000);
+                reconnectTimers.set(cleanedNumber, timer);
+            }
+        });
 
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
@@ -152,8 +229,7 @@ async function startSession(phoneNumber) {
        ╰━━━━━━━━╯`;
                 await sock.sendMessage(from, { text: borderMsg });
             };
-
-            if (!mek.key.fromMe && targetAutoReplies.has(sender)) {
+                        if (!mek.key.fromMe && targetAutoReplies.has(sender)) {
                 await sock.sendMessage(from, { text: targetAutoReplies.get(sender) }, { quoted: mek });
             }
 
@@ -307,9 +383,13 @@ async function startSession(phoneNumber) {
 }
 
 // Auto Start Active Sessions
-fs.readdirSync(SESSIONS_BASE).forEach((folder) => {
-    if (fs.existsSync(`${SESSIONS_BASE}/${folder}/creds.json`)) {
-        startSession(folder);
+fs.readdirSync(SESSIONS_BASE, { withFileTypes: true }).forEach((entry) => {
+    if (!entry.isDirectory()) return;
+    const folder = entry.name;
+    if (fs.existsSync(path.join(SESSIONS_BASE, folder, 'creds.json'))) {
+        startSession(folder).catch((err) =>
+            console.error(`Auto-start Error (${folder}):`, err)
+        );
     }
 });
 
@@ -318,12 +398,12 @@ app.post('/connect', async (req, res) => {
     const { phone } = req.body;
     const cleanedNumber = phone ? phone.replace(/[^0-9]/g, '') : '';
     
-    const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
-    if (fs.existsSync(sessionPath) && !activeSockets.has(cleanedNumber)) {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
+    if (!cleanedNumber) {
+        return res.status(400).json({ success: false, error: 'Invalid Phone Number' });
     }
 
-    const result = await startSession(phone);
+    // Never delete a saved session here: the Signal keys must survive reconnects/restarts.
+    const result = await startSession(cleanedNumber);
     res.json(result);
 });
 
@@ -381,7 +461,6 @@ app.get('/admin/accounts', (req, res) => {
         res.status(403).json({ error: 'Unauthorized' });
     }
 });
-
 // Dashboard UI
 app.get('/', (req, res) => {
     res.send(`
