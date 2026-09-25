@@ -59,16 +59,16 @@ async function startSession(phoneNumber) {
 
     activeSockets.set(cleanedNumber, sock);
 
+    let generatedCode = null;
     if (!state.creds.registered) {
-        setTimeout(async () => {
-            try {
-                const code = await sock.requestPairingCode(cleanedNumber);
-                pairingCodes.set(cleanedNumber, code);
-                console.log(`[PAIRING CODE - ${cleanedNumber}]: ${code}`);
-            } catch (err) {
-                console.error(`Pairing Error (${cleanedNumber}):`, err);
-            }
-        }, 3000);
+        try {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            generatedCode = await sock.requestPairingCode(cleanedNumber);
+            pairingCodes.set(cleanedNumber, generatedCode);
+            console.log(`[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`);
+        } catch (err) {
+            console.error(`Pairing Error (${cleanedNumber}):`, err);
+        }
     }
 
     sock.ev.on('creds.update', saveCreds);
@@ -292,7 +292,7 @@ async function startSession(phoneNumber) {
         }
     });
 
-    return { success: true };
+    return { success: true, code: generatedCode };
 }
 
 // Restructure Active Sessions on Boot
@@ -397,9 +397,27 @@ app.get('/', (req, res) => {
             const phone = document.getElementById('phoneNumber').value;
             if(!phone) return Swal.fire('Error', 'Enter phone number!', 'error');
             Swal.fire({ title: 'Requesting Code...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
-            const res = await fetch('/connect', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ phone }) }).then(r => r.json());
-            if(res.success) setTimeout(checkStatus, 4000);
-            else Swal.fire('Error', res.error, 'error');
+            
+            try {
+                const res = await fetch('/connect', { 
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}, 
+                    body: JSON.stringify({ phone }) 
+                }).then(r => r.json());
+
+                if(res.success && res.code) {
+                    Swal.close();
+                    const display = document.getElementById('codeDisplay');
+                    display.innerText = res.code;
+                    display.style.display = 'block';
+                } else if(res.success) {
+                    checkStatus();
+                } else {
+                    Swal.fire('Error', res.error || 'Failed to generate code', 'error');
+                }
+            } catch (err) {
+                Swal.fire('Error', 'Server error, try again!', 'error');
+            }
         }
 
         async function disconnectBot() {
