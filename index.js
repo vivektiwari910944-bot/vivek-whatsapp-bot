@@ -13,7 +13,6 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
 import express from 'express';
-import { MsEdgeTTS, OUTPUT_FORMAT } from 'edge-text-to-speech';
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -153,11 +152,6 @@ async function startSession(phoneNumber) {
       ╰━━╮     ╭━━╯
           ╰━━━╯
 
-   ╭─╮  🎙️ 𝙑𝙊𝙄𝘾𝙀 𝙈𝘼𝙂𝙄𝘾
-   ╰╮╰━━━━━━━━━━━━━━━━
-    ╰─ 𝙩𝙩𝙨𝙜 <𝙣𝙪𝙢𝙗𝙚𝙧> <𝙩𝙚𝙭𝙩>
-       𝙩𝙩𝙨𝙗 <𝙣𝙪𝙢𝙗𝙚𝙧> <𝙩𝙚𝙭𝙩>
-
       ╭╮ 🎯 𝙍𝙀𝙋𝙇𝙔 𝙈𝙊𝘿𝙀
    ╭━━╯╰━━━━━━━━━━━━━━
    ╰━━ 𝙖𝙪𝙩𝙤𝙧𝙚𝙥𝙡𝙮 <𝙈𝙎𝙂>
@@ -173,7 +167,7 @@ async function startSession(phoneNumber) {
    ╰━━ 𝙖𝙞 <𝙦𝙪𝙚𝙨𝙩𝙞𝙤𝙣>
        𝙨𝙩𝙞𝙘𝙠𝙚𝙧
 
-   ╭╮ 👥 𝙂𝙍𝙊𝙐𝙋 𝙒𝙀𝘼𝙋𝙊𝙉𝙎
+   ╭╮ 👥 𝙍𝙊𝙐𝙋 𝙒𝙀𝘼𝙋𝙊𝙉𝙎
    ╰╰━━╮━━━━━━━━━━━━━━
         ╰─ 𝙩𝙖𝙜𝙖𝙡𝙡
            𝙥𝙞𝙣𝙜 / 𝙧𝙪𝙣𝙩𝙞𝙢𝙚
@@ -202,26 +196,7 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 4. Secret TTS
-            if (command === '.ttsg' || command === 'ttsg' || command === '.ttsb' || command === 'ttsb') {
-                if (!qtext) return sendBorderStatus('𝙏𝙏𝙎 𝙀𝙍𝙍𝙊𝙍', 'Text missing!');
-                let targetJid = from;
-                let textToSend = qtext;
-                if (/^\d{10,15}$/.test(args[0])) {
-                    targetJid = `${args[0]}@s.whatsapp.net`;
-                    textToSend = args.slice(1).join(' ');
-                }
-                const tts = new MsEdgeTTS();
-                const voice = command.includes('ttsg') ? 'hi-IN-SwaraNeural' : 'hi-IN-MadhurNeural';
-                await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-                const filePath = `./tts_${Date.now()}.mp3`;
-                await tts.toFile(filePath, textToSend);
-                await sock.sendMessage(targetJid, { audio: { url: filePath }, mimetype: 'audio/mp4', ptt: true });
-                if (targetJid !== from) await sendBorderStatus('𝙑𝙊𝙄𝘾𝙀 𝙉𝙊𝙏𝙀 𝙎𝙀𝙉𝙏', `Secretly sent to @${targetJid.split('@')[0]}`);
-                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-            }
-
-            // 5. View-Once Saver: haha
+            // 4. View-Once Saver: haha
             if (command === 'haha!' || command === 'haha' || command === '.haha') {
                 const isQuotedMedia = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
                 let targetMessage = isQuotedMedia ? mek.message.extendedTextMessage.contextInfo.quotedMessage : mek.message;
@@ -245,7 +220,7 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 6. Status Saver: ss
+            // 5. Status Saver: ss
             if (command === '.ss' || command === 'ss' || command === '.savestatus') {
                 const isQuoted = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
                 if (isQuoted) {
@@ -266,7 +241,7 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 7. AI Assistant: ai
+            // 6. AI Assistant: ai
             if (command === '.ai' || command === 'ai') {
                 if (!qtext) return sendBorderStatus('𝘼𝙄 𝙀𝙍𝙍𝙊𝙍', 'Please ask a question.');
                 try {
@@ -278,7 +253,7 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 8. Sticker Maker: sticker
+            // 7. Sticker Maker: sticker
             if (command === '.s' || command === '.sticker' || command === 'sticker') {
                 const isQuotedImage = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage?.imageMessage;
                 const isImage = type === 'imageMessage';
@@ -294,7 +269,7 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 9. Tagall
+            // 8. Tagall
             if ((command === '.tagall' || command === 'tagall') && isGroup) {
                 const groupMetadata = await sock.groupMetadata(from);
                 let text = `📢 *ATTENTION EVERYONE*\n\n`;
@@ -307,7 +282,7 @@ async function startSession(phoneNumber) {
                 await sendBorderStatus('𝙏𝘼𝙂𝘼𝙇𝙇', 'Tagged all members in group!');
             }
 
-            // 10. Ping & Runtime
+            // 9. Ping & Runtime
             if (command === '.ping' || command === 'ping' || command === '.runtime' || command === 'runtime') {
                 await sendBorderStatus('𝙋𝙄𝙉𝙂 & 𝙍𝙐𝙉𝙏𝙄𝙈𝙀', `Status: Online 🟢\n       ⏳ Uptime: ${getUptime()}`);
             }
