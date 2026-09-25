@@ -34,13 +34,15 @@ const getUptime = () => {
     const uptimeSeconds = Math.floor(process.uptime());
     const hours = Math.floor(uptimeSeconds / 3600);
     const minutes = Math.floor((uptimeSeconds % 3600) / 60);
-    const seconds = uptimeSeconds % 60;
+    const seconds = Math.floor(uptimeSeconds % 60);
     return `${hours}h ${minutes}m ${seconds}s`;
 };
 
 async function startSession(phoneNumber) {
     const cleanedNumber = phoneNumber.replace(/[^0-9]/g, '');
     if (!cleanedNumber) return { success: false, error: 'Invalid Phone Number' };
+
+    const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
 
     if (activeSockets.has(cleanedNumber)) {
         try {
@@ -51,9 +53,6 @@ async function startSession(phoneNumber) {
         } catch (e) {}
     }
 
-    const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
-    fs.mkdirSync(sessionPath, { recursive: true });
-
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -61,24 +60,27 @@ async function startSession(phoneNumber) {
         auth: state,
         version,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Desktop'),
+        browser: Browsers.ubuntu('Chrome'),
         printQRInTerminal: false,
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 20000,
+        keepAliveIntervalMs: 30000,
         syncFullHistory: false
     });
 
     activeSockets.set(cleanedNumber, sock);
 
     let generatedCode = null;
-    if (!state.creds.registered) {
+
+    if (!sock.authState.creds.registered) {
         try {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+            await new Promise((resolve) => setTimeout(resolve, 3000));
             generatedCode = await sock.requestPairingCode(cleanedNumber);
             pairingCodes.set(cleanedNumber, generatedCode);
             console.log(`[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`);
         } catch (err) {
             console.error(`Pairing Error (${cleanedNumber}):`, err);
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+            return { success: false, error: 'Pairing code generation failed. Try again.' };
         }
     }
 
@@ -89,11 +91,12 @@ async function startSession(phoneNumber) {
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : 500;
             pairingCodes.delete(cleanedNumber);
-            if (statusCode !== DisconnectReason.loggedOut) {
-                setTimeout(() => startSession(cleanedNumber), 3000);
-            } else {
+            
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 activeSockets.delete(cleanedNumber);
                 fs.rmSync(sessionPath, { recursive: true, force: true });
+            } else {
+                setTimeout(() => startSession(cleanedNumber), 3000);
             }
         } else if (connection === 'open') {
             pairingCodes.delete(cleanedNumber);
@@ -150,15 +153,12 @@ async function startSession(phoneNumber) {
                 await sock.sendMessage(from, { text: borderMsg });
             };
 
-            // 1. Target Auto-Reply Engine
             if (!mek.key.fromMe && targetAutoReplies.has(sender)) {
                 await sock.sendMessage(from, { text: targetAutoReplies.get(sender) }, { quoted: mek });
             }
 
-            // Strict Owner Check
             if (!mek.key.fromMe) return;
 
-            // 2. Menu Command
             if (command === '.menu' || command === 'menu') {
                 const menuText = `╭━━━━━━━╮
     ╭━━━╯  ⚡  ╰━━━╮
@@ -195,7 +195,6 @@ async function startSession(phoneNumber) {
                 await sock.sendMessage(from, { text: menuText }, { quoted: mek });
             }
 
-            // 3. Auto-Reply
             if (command === '.autoreply' || command === 'autoreply') {
                 let targetJid = from;
                 if (isGroup && type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage) {
@@ -212,7 +211,6 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 4. Silent View-Once Saver (Reaction Only - No Border Text)
             if (command === 'haha!' || command === 'haha' || command === '.haha') {
                 const isQuotedMedia = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
                 let targetMessage = isQuotedMedia ? mek.message.extendedTextMessage.contextInfo.quotedMessage : mek.message;
@@ -228,7 +226,6 @@ async function startSession(phoneNumber) {
                     let buffer = Buffer.from([]);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-                    // Send media to owner DM silently
                     if (mediaType === 'imageMessage') {
                         await sock.sendMessage(botOwner, { image: buffer, caption: '🤫 *View-Once Decrypted*' });
                     } else if (mediaType === 'videoMessage') {
@@ -237,12 +234,10 @@ async function startSession(phoneNumber) {
                         await sock.sendMessage(botOwner, { audio: buffer, mimetype: 'audio/mp4' });
                     }
 
-                    // React to message stealthily
                     await sock.sendMessage(from, { react: { text: '✅', key: mek.key } });
                 }
             }
 
-            // 5. Silent Status Saver (Reaction Only)
             if (command === '.ss' || command === 'ss' || command === '.savestatus') {
                 const isQuoted = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
                 if (isQuoted) {
@@ -263,7 +258,6 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 6. AI Assistant: ai
             if (command === '.ai' || command === 'ai') {
                 if (!qtext) return sendBorderStatus('𝘼𝙄 𝙀𝙍𝙍𝙊𝙍', 'Please ask a question.');
                 try {
@@ -275,7 +269,6 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 7. Sticker Maker: sticker
             if (command === '.s' || command === '.sticker' || command === 'sticker') {
                 const isQuotedImage = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage?.imageMessage;
                 const isImage = type === 'imageMessage';
@@ -290,7 +283,6 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 8. Tagall
             if ((command === '.tagall' || command === 'tagall') && isGroup) {
                 const groupMetadata = await sock.groupMetadata(from);
                 let text = `📢 *ATTENTION EVERYONE*\n\n`;
@@ -302,7 +294,6 @@ async function startSession(phoneNumber) {
                 await sock.sendMessage(from, { text, mentions }, { quoted: mek });
             }
 
-            // 9. Ping & Runtime
             if (command === '.ping' || command === 'ping' || command === '.runtime' || command === 'runtime') {
                 await sendBorderStatus('𝙋𝙄𝙉𝙂 & 𝙍𝙐𝙉𝙏𝙄𝙈𝙀', `Status: Online 🟢\n       ⏳ Uptime: ${getUptime()}`);
             }
@@ -315,7 +306,7 @@ async function startSession(phoneNumber) {
     return { success: true, code: generatedCode };
 }
 
-// Restructure Active Sessions on Boot
+// Auto Start Active Sessions
 fs.readdirSync(SESSIONS_BASE).forEach((folder) => {
     if (fs.existsSync(`${SESSIONS_BASE}/${folder}/creds.json`)) {
         startSession(folder);
@@ -325,24 +316,37 @@ fs.readdirSync(SESSIONS_BASE).forEach((folder) => {
 // APIs
 app.post('/connect', async (req, res) => {
     const { phone } = req.body;
+    const cleanedNumber = phone ? phone.replace(/[^0-9]/g, '') : '';
+    
+    const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
+    if (fs.existsSync(sessionPath) && !activeSockets.has(cleanedNumber)) {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+    }
+
     const result = await startSession(phone);
     res.json(result);
 });
 
 app.post('/disconnect', async (req, res) => {
     const { phone } = req.body;
-    const cleanedNumber = phone.replace(/[^0-9]/g, '');
+    const cleanedNumber = phone ? phone.replace(/[^0-9]/g, '') : '';
+    
     if (activeSockets.has(cleanedNumber)) {
-        const sock = activeSockets.get(cleanedNumber);
-        sock.ev.removeAllListeners();
-        await sock.logout();
-        sock.end(undefined);
+        try {
+            const sock = activeSockets.get(cleanedNumber);
+            sock.ev.removeAllListeners();
+            await sock.logout();
+            sock.end(undefined);
+        } catch(e) {}
         activeSockets.delete(cleanedNumber);
-        fs.rmSync(`${SESSIONS_BASE}/${cleanedNumber}`, { recursive: true, force: true });
-        res.json({ success: true, message: 'Session Removed' });
-    } else {
-        res.json({ success: false, error: 'Session Not Found' });
     }
+    
+    const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
+    if (fs.existsSync(sessionPath)) {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+    }
+    
+    res.json({ success: true, message: 'Session Deleted Successfully' });
 });
 
 app.get('/status/:phone', (req, res) => {
@@ -352,20 +356,36 @@ app.get('/status/:phone', (req, res) => {
     res.json({ connected: isConnected, code });
 });
 
+// Admin API: Lists active and saved session folders
 app.get('/admin/accounts', (req, res) => {
     const password = req.query.pass;
     if (password === ADMIN_PASSWORD) {
-        const accounts = Array.from(activeSockets.keys()).map((num) => ({
+        let allSessions = new Set();
+        
+        // Active sockets
+        activeSockets.forEach((_, key) => allSessions.add(key));
+        
+        // Folder check
+        if (fs.existsSync(SESSIONS_BASE)) {
+            fs.readdirSync(SESSIONS_BASE).forEach(folder => {
+                if(fs.existsSync(`${SESSIONS_BASE}/${folder}/creds.json`)) {
+                    allSessions.add(folder);
+                }
+            });
+        }
+
+        const accounts = Array.from(allSessions).map((num) => ({
             phone: num,
-            status: pairingCodes.has(num) ? 'Pairing' : 'Connected 🟢'
+            status: activeSockets.has(num) ? 'Connected 🟢' : (pairingCodes.has(num) ? 'Pairing 🟡' : 'Saved 📁')
         }));
+
         res.json({ accounts, uptime: getUptime() });
     } else {
         res.status(403).json({ error: 'Unauthorized' });
     }
 });
 
-// Web Dashboard UI Route
+// Dashboard UI
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -414,6 +434,8 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
+        let cachedAdminPass = '';
+
         async function connectBot() {
             const phone = document.getElementById('phoneNumber').value;
             if(!phone) return Swal.fire('Error', 'Enter phone number!', 'error');
@@ -441,14 +463,23 @@ app.get('/', (req, res) => {
             }
         }
 
-        async function disconnectBot() {
-            const phone = document.getElementById('phoneNumber').value;
+        async function disconnectBot(targetPhone) {
+            const phone = targetPhone || document.getElementById('phoneNumber').value;
             if(!phone) return Swal.fire('Error', 'Enter phone number!', 'error');
-            const res = await fetch('/disconnect', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ phone }) }).then(r => r.json());
+            
+            const res = await fetch('/disconnect', { 
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'}, 
+                body: JSON.stringify({ phone }) 
+            }).then(r => r.json());
+
             if(res.success) {
-                Swal.fire('Success', 'Account Removed!', 'success');
+                Swal.fire('Success', 'Session Removed!', 'success');
                 document.getElementById('codeDisplay').style.display = 'none';
-            } else Swal.fire('Error', res.error, 'error');
+                if(cachedAdminPass) fetchAdminSessions();
+            } else {
+                Swal.fire('Error', res.error, 'error');
+            }
         }
 
         async function checkStatus() {
@@ -469,23 +500,50 @@ app.get('/', (req, res) => {
         }
 
         async function openAdminPanel() {
-            const { value: password } = await Swal.fire({ title: 'Admin Verification', input: 'password', showCancelButton: true });
-            if (password === 'VIVEKJOD') {
-                const res = await fetch('/admin/accounts?pass=' + password).then(r => r.json());
+            if(!cachedAdminPass) {
+                const { value: password } = await Swal.fire({ title: 'Admin Verification', input: 'password', showCancelButton: true });
+                if (password) cachedAdminPass = password;
+            }
+            if (cachedAdminPass) fetchAdminSessions();
+        }
+
+        async function fetchAdminSessions() {
+            try {
+                const res = await fetch('/admin/accounts?pass=' + cachedAdminPass).then(r => r.json());
+                if (res.error) {
+                    cachedAdminPass = '';
+                    return Swal.fire('Denied', 'Wrong Password!', 'error');
+                }
                 const list = document.getElementById('accountsList');
                 list.innerHTML = '';
+                if(res.accounts.length === 0) {
+                    list.innerHTML = '<div style="color:#aaa;">No active or saved sessions found.</div>';
+                }
                 res.accounts.forEach(acc => {
-                    list.innerHTML += \`<div class="account-card"><span>+\${acc.phone} (\${acc.status})</span><button class="btn btn-danger" style="padding:4px 8px; font-size:12px;" onclick="adminRemove('\${acc.phone}')">Remove</button></div>\`;
+                    list.innerHTML += \`<div class="account-card">
+                        <span>+\${acc.phone} (\${acc.status})</span>
+                        <button class="btn btn-danger" style="padding:6px 12px; font-size:12px;" onclick="adminRemove('\${acc.phone}')">🗑️ Delete</button>
+                    </div>\`;
                 });
                 document.getElementById('adminPanel').style.display = 'block';
-                Swal.fire('Welcome Boss!', 'Admin Panel Unlocked', 'success');
-            } else if(password) Swal.fire('Denied', 'Wrong Password!', 'error');
+            } catch(e) {
+                Swal.fire('Error', 'Could not load sessions', 'error');
+            }
         }
 
         async function adminRemove(phone) {
-            document.getElementById('phoneNumber').value = phone;
-            await disconnectBot();
-            openAdminPanel();
+            Swal.fire({
+                title: 'Delete Session?',
+                text: 'Are you sure you want to delete session for +' + phone + '?',
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonColor: '#ff0055',
+                confirmButtonText: 'Yes, Delete!'
+            }).then(async (result) => {
+                if (result.isConfirmed) {
+                    await disconnectBot(phone);
+                }
+            });
         }
     </script>
 </body>
