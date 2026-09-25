@@ -25,6 +25,7 @@ const activeSockets = new Map();
 const pairingCodes = new Map();
 const targetAutoReplies = new Map();
 const messageStore = new Map();
+const processedMessages = new Set();
 
 const SESSIONS_BASE = './sessions';
 if (!fs.existsSync(SESSIONS_BASE)) fs.mkdirSync(SESSIONS_BASE, { recursive: true });
@@ -41,6 +42,15 @@ async function startSession(phoneNumber) {
     const cleanedNumber = phoneNumber.replace(/[^0-9]/g, '');
     if (!cleanedNumber) return { success: false, error: 'Invalid Phone Number' };
 
+    if (activeSockets.has(cleanedNumber)) {
+        try {
+            const oldSock = activeSockets.get(cleanedNumber);
+            oldSock.ev.removeAllListeners();
+            oldSock.end(undefined);
+            activeSockets.delete(cleanedNumber);
+        } catch (e) {}
+    }
+
     const sessionPath = `${SESSIONS_BASE}/${cleanedNumber}`;
     fs.mkdirSync(sessionPath, { recursive: true });
 
@@ -51,10 +61,11 @@ async function startSession(phoneNumber) {
         auth: state,
         version,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Safari'),
+        browser: Browsers.macOS('Desktop'),
         printQRInTerminal: false,
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 20000
+        keepAliveIntervalMs: 20000,
+        syncFullHistory: false
     });
 
     activeSockets.set(cleanedNumber, sock);
@@ -79,7 +90,7 @@ async function startSession(phoneNumber) {
             const statusCode = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : 500;
             pairingCodes.delete(cleanedNumber);
             if (statusCode !== DisconnectReason.loggedOut) {
-                startSession(cleanedNumber);
+                setTimeout(() => startSession(cleanedNumber), 3000);
             } else {
                 activeSockets.delete(cleanedNumber);
                 fs.rmSync(sessionPath, { recursive: true, force: true });
@@ -92,8 +103,13 @@ async function startSession(phoneNumber) {
 
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         try {
+            if (chatUpdate.type !== 'notify') return;
             const mek = chatUpdate.messages[0];
-            if (!mek.message || mek.key.remoteJid === 'status@broadcast') return;
+            if (!mek || !mek.message || mek.key.remoteJid === 'status@broadcast') return;
+
+            if (processedMessages.has(mek.key.id)) return;
+            processedMessages.add(mek.key.id);
+            if (processedMessages.size > 2000) processedMessages.clear();
 
             if (mek.key.id) messageStore.set(mek.key.id, mek);
 
@@ -101,7 +117,7 @@ async function startSession(phoneNumber) {
             const isGroup = from.endsWith('@g.us');
             const type = Object.keys(mek.message)[0];
             const sender = mek.key.participant || mek.key.remoteJid;
-            const botOwner = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+            const botOwner = sock.user.id ? (sock.user.id.split(':')[0] + '@s.whatsapp.net') : from;
 
             const body = (type === 'conversation') ? mek.message.conversation : 
                          (type === 'extendedTextMessage') ? mek.message.extendedTextMessage.text : 
@@ -131,7 +147,7 @@ async function startSession(phoneNumber) {
     ╭━━╯  𝙑𝙄𝙑𝙀权  ╰━━╮
     ╰━━ 𝙎𝙔𝙎𝙏𝙀𝙈  ━━╯
        ╰━━━━━━━━╯`;
-                await sock.sendMessage(from, { text: borderMsg }, { quoted: mek });
+                await sock.sendMessage(from, { text: borderMsg });
             };
 
             // 1. Target Auto-Reply Engine
@@ -196,7 +212,7 @@ async function startSession(phoneNumber) {
                 }
             }
 
-            // 4. View-Once Saver: haha
+            // 4. Silent View-Once Saver (Reaction Only - No Border Text)
             if (command === 'haha!' || command === 'haha' || command === '.haha') {
                 const isQuotedMedia = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
                 let targetMessage = isQuotedMedia ? mek.message.extendedTextMessage.contextInfo.quotedMessage : mek.message;
@@ -212,15 +228,21 @@ async function startSession(phoneNumber) {
                     let buffer = Buffer.from([]);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-                    if (mediaType === 'imageMessage') await sock.sendMessage(botOwner, { image: buffer, caption: '🤫 *View-Once Saved*' });
-                    else if (mediaType === 'videoMessage') await sock.sendMessage(botOwner, { video: buffer, caption: '🤫 *View-Once Saved*' });
-                    else if (mediaType === 'audioMessage') await sock.sendMessage(botOwner, { audio: buffer, mimetype: 'audio/mp4' });
-                    
-                    await sendBorderStatus('𝙎𝙏𝙀𝘼𝙇𝙏𝙃 𝙎𝘼𝙑𝙀𝙍', 'Media saved to Owner DM!');
+                    // Send media to owner DM silently
+                    if (mediaType === 'imageMessage') {
+                        await sock.sendMessage(botOwner, { image: buffer, caption: '🤫 *View-Once Decrypted*' });
+                    } else if (mediaType === 'videoMessage') {
+                        await sock.sendMessage(botOwner, { video: buffer, caption: '🤫 *View-Once Decrypted*' });
+                    } else if (mediaType === 'audioMessage') {
+                        await sock.sendMessage(botOwner, { audio: buffer, mimetype: 'audio/mp4' });
+                    }
+
+                    // React to message stealthily
+                    await sock.sendMessage(from, { react: { text: '✅', key: mek.key } });
                 }
             }
 
-            // 5. Status Saver: ss
+            // 5. Silent Status Saver (Reaction Only)
             if (command === '.ss' || command === 'ss' || command === '.savestatus') {
                 const isQuoted = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
                 if (isQuoted) {
@@ -236,7 +258,7 @@ async function startSession(phoneNumber) {
                         if (mediaType === 'imageMessage') await sock.sendMessage(botOwner, { image: buffer, caption: '📲 *Status Saved!*' });
                         else await sock.sendMessage(botOwner, { video: buffer, caption: '📲 *Status Saved!*' });
                         
-                        await sendBorderStatus('𝙎𝙏𝘼𝙏𝙐𝙎 𝙎𝘼𝙑𝙀𝙍', 'Status downloaded to Owner DM!');
+                        await sock.sendMessage(from, { react: { text: '✅', key: mek.key } });
                     }
                 }
             }
@@ -265,7 +287,6 @@ async function startSession(phoneNumber) {
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
                     
                     await sock.sendMessage(from, { sticker: buffer }, { quoted: mek });
-                    await sendBorderStatus('𝙎𝙏𝙄𝘾𝙆𝙀𝙍 𝙈𝘼𝙆𝙀𝙍', 'Sticker generated!');
                 }
             }
 
@@ -279,7 +300,6 @@ async function startSession(phoneNumber) {
                     mentions.push(mem.id);
                 }
                 await sock.sendMessage(from, { text, mentions }, { quoted: mek });
-                await sendBorderStatus('𝙏𝘼𝙂𝘼𝙇𝙇', 'Tagged all members in group!');
             }
 
             // 9. Ping & Runtime
@@ -314,6 +334,7 @@ app.post('/disconnect', async (req, res) => {
     const cleanedNumber = phone.replace(/[^0-9]/g, '');
     if (activeSockets.has(cleanedNumber)) {
         const sock = activeSockets.get(cleanedNumber);
+        sock.ev.removeAllListeners();
         await sock.logout();
         sock.end(undefined);
         activeSockets.delete(cleanedNumber);
