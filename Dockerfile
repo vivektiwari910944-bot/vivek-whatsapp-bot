@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
-# Python & System dependencies install
-RUN apk add --no-舆-cache python3 py3-pip procps
+# Python & System dependencies install (Cleaned command)
+RUN apk add --no-cache python3 py3-pip procps
 
 WORKDIR /app
 
