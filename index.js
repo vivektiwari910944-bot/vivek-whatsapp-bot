@@ -13,7 +13,7 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
 import express from 'express';
-import { MsEdgeTTS, OUTPUT_FORMAT } from 'edge-tts';
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'edge-text-to-speech';
 
 const app = express();
 const PORT = process.env.PORT || 10000;
