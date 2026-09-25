@@ -25,6 +25,16 @@ const activeSockets = new Map();
 const pairingCodes = new Map();
 const targetAutoReplies = new Map();
 const messageStore = new Map();
+
+// Baileys retry counter cache. Keep it outside the socket so reconnects
+// do not reset retry counts and cause decrypt/retry loops.
+const retryCounts = new Map();
+const msgRetryCounterCache = {
+    get: (key) => retryCounts.get(key),
+    set: (key, value) => { retryCounts.set(key, value); },
+    del: (key) => { retryCounts.delete(key); }
+};
+
 const processedMessages = new Set();
 const startingSessions = new Set();
 const reconnectTimers = new Map();
@@ -36,7 +46,7 @@ const getUptime = () => {
     const uptimeSeconds = Math.floor(process.uptime());
     const hours = Math.floor(uptimeSeconds / 3600);
     const minutes = Math.floor((uptimeSeconds % 3600) / 60);
-    const seconds = Math.floor(uptimeSeconds % 60);
+    const seconds = Math.floor((uptimeSeconds % 60));
     return `${hours}h ${minutes}m ${seconds}s`;
 };
 
@@ -68,8 +78,8 @@ async function startSession(phoneNumber, options = {}) {
     const cleanedNumber = String(phoneNumber || '').replace(/[^0-9]/g, '');
     if (!cleanedNumber) return { success: false, error: 'Invalid Phone Number' };
 
+    // Never create two Baileys sockets for the same WhatsApp account.
     const existing = activeSockets.get(cleanedNumber);
-
     if (existing) {
         return {
             success: true,
@@ -108,13 +118,34 @@ async function startSession(phoneNumber, options = {}) {
             markOnlineOnConnect: false,
             syncFullHistory: false,
             emitOwnEvents: true,
+            enableRecentMessageCache: true,
+            msgRetryCounterCache,
+            maxMsgRetryCount: 5,
 
-            // FIX FOR "WAITING FOR THIS MESSAGE"
+            // WhatsApp/Baileys can ask for an older message again during
+            // retry/decryption. Return the original message from our store.
+            // IMPORTANT: return undefined on a cache miss; never return a fake
+            // empty message because that can consume a retry permanently.
             getMessage: async (key) => {
                 const stored = messageStore.get(key?.id);
-                return stored?.message;
+                return stored?.message || undefined;
             }
         });
+
+        // Store every outgoing message immediately. A just-sent message can be
+        // requested for retry before messages.upsert is emitted.
+        const originalSendMessage = sock.sendMessage.bind(sock);
+        sock.sendMessage = async (jid, content, options) => {
+            const sent = await originalSendMessage(jid, content, options);
+            if (sent?.key?.id && sent?.message) {
+                messageStore.set(sent.key.id, sent);
+                if (messageStore.size > 5000) {
+                    const oldestKey = messageStore.keys().next().value;
+                    if (oldestKey) messageStore.delete(oldestKey);
+                }
+            }
+            return sent;
+        };
 
         activeSockets.set(cleanedNumber, sock);
 
@@ -130,34 +161,16 @@ async function startSession(phoneNumber, options = {}) {
 
                 generatedCode = await sock.requestPairingCode(cleanedNumber);
                 pairingCodes.set(cleanedNumber, generatedCode);
-
-                console.log(
-                    `[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`
-                );
-
+                console.log(`[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`);
             } catch (err) {
-                console.error(
-                    `Pairing Error (${cleanedNumber}):`,
-                    err
-                );
-
-                await closeSocket(
-                    cleanedNumber,
-                    sock
-                );
+                console.error(`Pairing Error (${cleanedNumber}):`, err);
+                await closeSocket(cleanedNumber, sock);
 
                 if (options.resetOnPairingError) {
-                    fs.rmSync(
-                        sessionPath,
-                        {
-                            recursive: true,
-                            force: true
-                        }
-                    );
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
                 }
 
                 startingSessions.delete(cleanedNumber);
-
                 return {
                     success: false,
                     error: 'Pairing code generation failed. Try again.'
@@ -165,239 +178,132 @@ async function startSession(phoneNumber, options = {}) {
             }
         }
 
-        sock.ev.on(
-            'creds.update',
-            saveCreds
-        );
+        sock.ev.on('creds.update', saveCreds);
 
-        sock.ev.on(
-            'connection.update',
-            async (upd) => {
+        sock.ev.on('connection.update', async (upd) => {
+            const { connection, lastDisconnect } = upd;
 
-                const {
-                    connection,
-                    lastDisconnect
-                } = upd;
+            if (connection === 'open') {
+                pairingCodes.delete(cleanedNumber);
+                startingSessions.delete(cleanedNumber);
+                console.log(`✅ Session Active: ${cleanedNumber}`);
+                return;
+            }
 
-                if (connection === 'open') {
+            if (connection !== 'close') return;
 
-                    pairingCodes.delete(
-                        cleanedNumber
+            const statusCode =
+                lastDisconnect?.error instanceof Boom
+                    ? lastDisconnect.error.output.statusCode
+                    : 500;
+
+            pairingCodes.delete(cleanedNumber);
+
+            // An old socket must never delete/restart a newer socket.
+            if (activeSockets.get(cleanedNumber) !== sock) return;
+
+            activeSockets.delete(cleanedNumber);
+            startingSessions.delete(cleanedNumber);
+
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                console.log(`🔴 Logged out: ${cleanedNumber}`);
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+                return;
+            }
+
+            // Reconnect without deleting credentials. This preserves Signal keys.
+            if (!reconnectTimers.has(cleanedNumber)) {
+                const timer = setTimeout(() => {
+                    reconnectTimers.delete(cleanedNumber);
+
+                    startSession(cleanedNumber).catch((err) =>
+                        console.error(`Reconnect Error (${cleanedNumber}):`, err)
                     );
+                }, 5000);
 
-                    startingSessions.delete(
-                        cleanedNumber
-                    );
+                reconnectTimers.set(cleanedNumber, timer);
+            }
+        });
 
-                    console.log(
-                        `✅ Session Active: ${cleanedNumber}`
-                    );
+        sock.ev.on('messages.upsert', async (chatUpdate) => {
+            try {
+                /*
+                 * FIX:
+                 * Store BOTH incoming and own/outgoing messages.
+                 * This gives Baileys a local copy when WhatsApp asks
+                 * for a message again instead of showing:
+                 *
+                 * "Waiting for this message. This may take a while."
+                 */
+                for (const msg of (chatUpdate.messages || [])) {
+                    if (msg?.key?.id && msg?.message) {
+                        messageStore.set(msg.key.id, msg);
 
-                    return;
+                        // Keep memory under control.
+                        if (messageStore.size > 5000) {
+                            const oldestKey = messageStore.keys().next().value;
+                            if (oldestKey) {
+                                messageStore.delete(oldestKey);
+                            }
+                        }
+                    }
                 }
 
-                if (connection !== 'close') return;
+                if (chatUpdate.type !== 'notify') return;
 
-                const statusCode =
-                    lastDisconnect?.error instanceof Boom
-                        ? lastDisconnect.error.output.statusCode
-                        : 500;
-
-                pairingCodes.delete(
-                    cleanedNumber
-                );
+                const mek = chatUpdate.messages[0];
 
                 if (
-                    activeSockets.get(
-                        cleanedNumber
-                    ) !== sock
+                    !mek ||
+                    !mek.message ||
+                    mek.key.remoteJid === 'status@broadcast'
                 ) return;
 
-                activeSockets.delete(
-                    cleanedNumber
-                );
+                if (processedMessages.has(mek.key.id)) return;
 
-                startingSessions.delete(
-                    cleanedNumber
-                );
+                processedMessages.add(mek.key.id);
 
-                if (
-                    statusCode ===
-                        DisconnectReason.loggedOut ||
-                    statusCode === 401
-                ) {
-
-                    console.log(
-                        `🔴 Logged out: ${cleanedNumber}`
-                    );
-
-                    fs.rmSync(
-                        sessionPath,
-                        {
-                            recursive: true,
-                            force: true
-                        }
-                    );
-
-                    return;
+                if (processedMessages.size > 2000) {
+                    processedMessages.clear();
                 }
 
-                if (
-                    !reconnectTimers.has(
-                        cleanedNumber
-                    )
-                ) {
-
-                    const timer =
-                        setTimeout(
-                            () => {
-
-                                reconnectTimers.delete(
-                                    cleanedNumber
-                                );
-
-                                startSession(
-                                    cleanedNumber
-                                ).catch(
-                                    (err) =>
-                                        console.error(
-                                            `Reconnect Error (${cleanedNumber}):`,
-                                            err
-                                        )
-                                );
-
-                            },
-                            5000
-                        );
-
-                    reconnectTimers.set(
-                        cleanedNumber,
-                        timer
-                    );
+                if (mek.key.id) {
+                    messageStore.set(mek.key.id, mek);
                 }
-            }
-        );
 
-        sock.ev.on(
-            'messages.upsert',
-            async (chatUpdate) => {
+                const from = mek.key.remoteJid;
+                const isGroup = from.endsWith('@g.us');
+                const type = Object.keys(mek.message)[0];
+                const sender = mek.key.participant || mek.key.remoteJid;
 
-                try {
+                const botOwner = sock.user.id
+                    ? (sock.user.id.split(':')[0] + '@s.whatsapp.net')
+                    : from;
 
-                    if (
-                        chatUpdate.type !==
-                        'notify'
-                    ) return;
+                const body =
+                    (type === 'conversation')
+                        ? mek.message.conversation
+                        : (type === 'extendedTextMessage')
+                            ? mek.message.extendedTextMessage.text
+                            : (type === 'imageMessage')
+                                ? mek.message.imageMessage.caption
+                                : (type === 'videoMessage')
+                                    ? mek.message.videoMessage.caption
+                                    : '';
 
-                    const mek =
-                        chatUpdate.messages[0];
+                const command = body.trim().toLowerCase().split(' ')[0];
+                const args = body.trim().split(' ').slice(1);
+                const qtext = args.join(' ');
 
-                    if (
-                        !mek ||
-                        !mek.message ||
-                        mek.key.remoteJid ===
-                            'status@broadcast'
-                    ) return;
-
-                    if (
-                        processedMessages.has(
-                            mek.key.id
-                        )
-                    ) return;
-
-                    processedMessages.add(
-                        mek.key.id
-                    );
-
-                    if (
-                        processedMessages.size >
-                        2000
-                    ) {
-                        processedMessages.clear();
-                    }
-
-                    // Store incoming messages for retry/decryption.
-                    if (mek.key.id) {
-                        messageStore.set(
-                            mek.key.id,
-                            mek
-                        );
-                    }
-
-                    const from =
-                        mek.key.remoteJid;
-
-                    const isGroup =
-                        from.endsWith('@g.us');
-
-                    const type =
-                        Object.keys(
-                            mek.message
-                        )[0];
-
-                    const sender =
-                        mek.key.participant ||
-                        mek.key.remoteJid;
-
-                    const botOwner =
-                        sock.user.id
-                            ? (
-                                sock.user.id
-                                    .split(':')[0] +
-                                '@s.whatsapp.net'
-                            )
-                            : from;
-
-                    const body =
-                        (type === 'conversation')
-                            ? mek.message.conversation
-
-                            : (type === 'extendedTextMessage')
-                                ? mek.message
-                                    .extendedTextMessage
-                                    .text
-
-                                : (type === 'imageMessage')
-                                    ? mek.message
-                                        .imageMessage
-                                        .caption
-
-                                    : (type === 'videoMessage')
-                                        ? mek.message
-                                            .videoMessage
-                                            .caption
-
-                                        : '';
-
-                    const command =
-                        body
-                            .trim()
-                            .toLowerCase()
-                            .split(' ')[0];
-
-                    const args =
-                        body
-                            .trim()
-                            .split(' ')
-                            .slice(1);
-
-                    const qtext =
-                        args.join(' ');
-
-                    const sendBorderStatus =
-                        async (
-                            statusTitle,
-                            statusText
-                        ) => {
-
-                            const borderMsg = `
+                const sendBorderStatus = async (statusTitle, statusText) => {
+                    const borderMsg = `
 ╭━━━━━━━╮
     ╭━━━╯  ⚡  ╰━━━╮
    ╱   𝙑𝙄𝙑𝙀权 𝙑𝙄𝘽𝙀𝙎   ╲
   ╲     𝙐𝙇𝙏𝙄𝙈𝘼𝙏𝙀     ╱
    ╰━━╮           ╭━━╯
       ╰━━╮     ╭━━╯
-          ╰━━━╯
+         ╰━━━╯
 
    ╭─╮  ⚡ 𝙎𝙔𝙎𝙏𝙀𝙈 𝙎𝙏𝘼𝙏𝙐𝙎
    ╰╮╰━━━━━━━━━━━━━━━━
@@ -409,53 +315,27 @@ async function startSession(phoneNumber, options = {}) {
     ╰━━ 𝙎𝙔𝙎𝙏𝙀𝙈  ━━╯
        ╰━━━━━━━━╯`;
 
-                            await sock.sendMessage(
-                                from,
-                                {
-                                    text: borderMsg
-                                }
-                            );
-                        };
+                    await sock.sendMessage(from, { text: borderMsg });
+                };
 
-                    if (
-                        !mek.key.fromMe &&
-                        targetAutoReplies.has(
-                            sender
-                        )
-                    ) {
+                if (!mek.key.fromMe && targetAutoReplies.has(sender)) {
+                    await sock.sendMessage(
+                        from,
+                        { text: targetAutoReplies.get(sender) },
+                        { quoted: mek }
+                    );
+                }
 
-                        await sock.sendMessage(
-                            from,
-                            {
-                                text:
-                                    targetAutoReplies.get(
-                                        sender
-                                    )
-                            },
-                            {
-                                quoted: mek
-                            }
-                        );
-                    }
+                if (!mek.key.fromMe) return;
 
-                    if (!mek.key.fromMe) return;
-
-                    // =========================
-                    // MENU
-                    // =========================
-
-                    if (
-                        command === '.menu' ||
-                        command === 'menu'
-                    ) {
-
-                        const menuText = `╭━━━━━━━╮
+                if (command === '.menu' || command === 'menu') {
+                    const menuText = `╭━━━━━━━╮
     ╭━━━╯  ⚡  ╰━━━╮
    ╱   𝙑𝙄𝙑𝙀权 𝙑𝙄𝘽𝙀𝙎   ╲
   ╲     𝙐𝙇𝙏𝙄𝙈𝘼𝙏𝙀     ╱
    ╰━━╮           ╭━━╯
       ╰━━╮     ╭━━╯
-          ╰━━━╯
+         ╰━━━╯
 
       ╭╮ 🎯 𝙍𝙀𝙋𝙇𝙔 𝙈𝙊𝘿𝙀
    ╭━━╯╰━━━━━━━━━━━━━━
@@ -465,7 +345,7 @@ async function startSession(phoneNumber, options = {}) {
    ╭─╮ 🕶️ 𝙎𝙏𝙀𝘼𝙇𝙏𝙃
    ╰━━╮━━━━━━━━━━━━━━
        ╰─ 𝙝𝙖𝙝𝙖
-          𝙨𝙨
+         𝙨𝙨
 
       ╭━━╮ 🤖 𝘼𝙄 𝙕𝙊𝙉𝙀
    ╭━━╯  ╰━━━━━━━━━━━━
@@ -482,615 +362,365 @@ async function startSession(phoneNumber, options = {}) {
     ╰━━ 𝙎𝙔𝙎𝙏𝙀𝙈  ━━╯
        ╰━━━━━━━━╯`;
 
-                        await sock.sendMessage(
-                            from,
-                            {
-                                text: menuText
-                            },
-                            {
-                                quoted: mek
-                            }
+                    await sock.sendMessage(
+                        from,
+                        { text: menuText },
+                        { quoted: mek }
+                    );
+                }
+
+                if (command === '.autoreply' || command === 'autoreply') {
+                    let targetJid = from;
+
+                    if (
+                        isGroup &&
+                        type === 'extendedTextMessage' &&
+                        mek.message.extendedTextMessage.contextInfo?.quotedMessage
+                    ) {
+                        targetJid =
+                            mek.message.extendedTextMessage.contextInfo.participant;
+                    }
+
+                    if (qtext.toLowerCase() === 'off') {
+                        targetAutoReplies.delete(targetJid);
+
+                        await sendBorderStatus(
+                            '𝘼𝙐𝙏𝙊𝙍𝙀𝙋𝙇𝙔 𝘿𝙀𝘼𝘾𝙏𝙄𝙑𝘼𝙏𝙀𝘿',
+                            `Removed for @${targetJid.split('@')[0]}`
+                        );
+                    } else if (qtext) {
+                        targetAutoReplies.set(targetJid, qtext);
+
+                        await sendBorderStatus(
+                            '𝘼𝙐𝙏𝙊𝙍𝙀𝙋𝙇𝙔 𝘼𝘾𝙏𝙄𝙑𝘼𝙏𝙀𝘿',
+                            `Set for @${targetJid.split('@')[0]}:\n"${qtext}"`
+                        );
+                    } else {
+                        await sendBorderStatus(
+                            '𝘼𝙐𝙏𝙊𝙍𝙀𝙋𝙇𝙔 𝙄𝙉𝙁𝙊',
+                            'Usage: .autoreply <MSG> | .autoreply off'
                         );
                     }
+                }
 
-                    // =========================
-                    // AUTOREPLY
-                    // =========================
+                if (
+                    command === 'haha!' ||
+                    command === 'haha' ||
+                    command === '.haha'
+                ) {
+                    try {
+                        const quoted =
+                            type === 'extendedTextMessage'
+                                ? mek.message.extendedTextMessage
+                                    ?.contextInfo
+                                    ?.quotedMessage
+                                : null;
 
-                    if (
-                        command === '.autoreply' ||
-                        command === 'autoreply'
-                    ) {
+                        let targetMessage = quoted || mek.message;
 
-                        let targetJid =
-                            from;
-
-                        if (
-                            isGroup &&
-                            type ===
-                                'extendedTextMessage' &&
-                            mek.message
-                                .extendedTextMessage
-                                .contextInfo
-                                ?.quotedMessage
-                        ) {
-
-                            targetJid =
-                                mek.message
-                                    .extendedTextMessage
-                                    .contextInfo
-                                    .participant;
-                        }
-
-                        if (
-                            qtext
-                                .toLowerCase() ===
-                            'off'
-                        ) {
-
-                            targetAutoReplies.delete(
-                                targetJid
-                            );
-
-                            await sendBorderStatus(
-                                '𝘼𝙐𝙏𝙊𝙍𝙀𝙋𝙇𝙔 𝘿𝙀𝘼𝘾𝙏𝙄𝙑𝘼𝙏𝙀𝘿',
-                                `Removed for @${targetJid.split('@')[0]}`
-                            );
-
-                        } else if (qtext) {
-
-                            targetAutoReplies.set(
-                                targetJid,
-                                qtext
-                            );
-
-                            await sendBorderStatus(
-                                '𝘼𝙐𝙏𝙊𝙍𝙀𝙋𝙇𝙔 𝘼𝘾𝙏𝙄𝙑𝘼𝙏𝙀𝘿',
-                                `Set for @${targetJid.split('@')[0]}:\n"${qtext}"`
-                            );
-
-                        } else {
-
-                            await sendBorderStatus(
-                                '𝘼𝙐𝙏𝙊𝙍𝙀𝙋𝙇𝙔 𝙄𝙉𝙁𝙊',
-                                'Usage: .autoreply <MSG> | .autoreply off'
-                            );
-                        }
-                    }
-
-                    // =========================
-                    // HAHA / VIEW ONCE SAVE
-                    // =========================
-
-                    if (
-                        command === 'haha!' ||
-                        command === 'haha' ||
-                        command === '.haha'
-                    ) {
-
-                        try {
-
-                            const quoted =
-                                type ===
-                                    'extendedTextMessage'
-                                    ? mek.message
-                                        .extendedTextMessage
-                                        ?.contextInfo
-                                        ?.quotedMessage
-                                    : null;
-
-                            let targetMessage =
-                                quoted ||
-                                mek.message;
-
-                            for (
-                                let i = 0;
-                                i < 5;
-                                i++
+                        // Unwrap WhatsApp wrapper messages recursively
+                        for (let i = 0; i < 5; i++) {
+                            if (targetMessage?.ephemeralMessage?.message) {
+                                targetMessage =
+                                    targetMessage.ephemeralMessage.message;
+                            } else if (targetMessage?.viewOnceMessage?.message) {
+                                targetMessage =
+                                    targetMessage.viewOnceMessage.message;
+                            } else if (
+                                targetMessage?.viewOnceMessageV2?.message
                             ) {
-
-                                if (
+                                targetMessage =
+                                    targetMessage.viewOnceMessageV2.message;
+                            } else if (
+                                targetMessage
+                                    ?.viewOnceMessageV2Extension
+                                    ?.message
+                            ) {
+                                targetMessage =
                                     targetMessage
-                                        ?.ephemeralMessage
-                                        ?.message
-                                ) {
-
-                                    targetMessage =
-                                        targetMessage
-                                            .ephemeralMessage
-                                            .message;
-
-                                } else if (
+                                        .viewOnceMessageV2Extension.message;
+                            } else if (
+                                targetMessage
+                                    ?.documentWithCaptionMessage
+                                    ?.message
+                            ) {
+                                targetMessage =
                                     targetMessage
-                                        ?.viewOnceMessage
-                                        ?.message
-                                ) {
-
-                                    targetMessage =
-                                        targetMessage
-                                            .viewOnceMessage
-                                            .message;
-
-                                } else if (
-                                    targetMessage
-                                        ?.viewOnceMessageV2
-                                        ?.message
-                                ) {
-
-                                    targetMessage =
-                                        targetMessage
-                                            .viewOnceMessageV2
-                                            .message;
-
-                                } else if (
-                                    targetMessage
-                                        ?.viewOnceMessageV2Extension
-                                        ?.message
-                                ) {
-
-                                    targetMessage =
-                                        targetMessage
-                                            .viewOnceMessageV2Extension
-                                            .message;
-
-                                } else if (
-                                    targetMessage
-                                        ?.documentWithCaptionMessage
-                                        ?.message
-                                ) {
-
-                                    targetMessage =
-                                        targetMessage
-                                            .documentWithCaptionMessage
-                                            .message;
-
-                                } else {
-
-                                    break;
-                                }
+                                        .documentWithCaptionMessage.message;
+                            } else {
+                                break;
                             }
+                        }
 
-                            const mediaType =
-                                Object.keys(
-                                    targetMessage ||
-                                    {}
-                                ).find(
-                                    key =>
-                                        [
-                                            'imageMessage',
-                                            'videoMessage',
-                                            'audioMessage',
-                                            'documentMessage'
-                                        ].includes(key)
-                                );
+                        const mediaType = Object.keys(
+                            targetMessage || {}
+                        ).find((key) =>
+                            [
+                                'imageMessage',
+                                'videoMessage',
+                                'audioMessage',
+                                'documentMessage'
+                            ].includes(key)
+                        );
 
-                            if (!mediaType) {
+                        if (!mediaType) {
+                            await sendBorderStatus(
+                                '𝙑𝙄𝙀𝙒-𝙊𝙉𝘾𝙀 𝙀𝙍𝙍𝙊𝙍',
+                                'No supported media found.'
+                            );
+                            return;
+                        }
 
-                                await sendBorderStatus(
-                                    '𝙑𝙄𝙀𝙒-𝙊𝙉𝘾𝙀 𝙀𝙍𝙍𝙊𝙍',
-                                    'No supported media found.'
-                                );
+                        const streamType =
+                            mediaType.replace('Message', '');
 
-                                return;
+                        const media = targetMessage[mediaType];
+
+                        const stream = await downloadContentFromMessage(
+                            media,
+                            streamType
+                        );
+
+                        const chunks = [];
+
+                        for await (const chunk of stream) {
+                            chunks.push(chunk);
+                        }
+
+                        const buffer = Buffer.concat(chunks);
+
+                        if (mediaType === 'imageMessage') {
+                            await sock.sendMessage(botOwner, {
+                                image: buffer,
+                                caption: '🤫 *View-Once Saved*'
+                            });
+                        } else if (mediaType === 'videoMessage') {
+                            await sock.sendMessage(botOwner, {
+                                video: buffer,
+                                caption: '🤫 *View-Once Saved*'
+                            });
+                        } else if (mediaType === 'audioMessage') {
+                            await sock.sendMessage(botOwner, {
+                                audio: buffer,
+                                mimetype: media.mimetype || 'audio/mp4'
+                            });
+                        } else if (mediaType === 'documentMessage') {
+                            await sock.sendMessage(botOwner, {
+                                document: buffer,
+                                mimetype:
+                                    media.mimetype ||
+                                    'application/octet-stream',
+                                fileName:
+                                    media.fileName ||
+                                    'saved-file'
+                            });
+                        }
+
+                        await sock.sendMessage(from, {
+                            react: {
+                                text: '✅',
+                                key: mek.key
                             }
+                        });
 
+                    } catch (err) {
+                        console.error('View Once Error:', err);
+
+                        await sendBorderStatus(
+                            '𝙑𝙄𝙀𝙒-𝙊𝙉𝘾𝙀 𝙀𝙍𝙍𝙊𝙍',
+                            'Media download failed. Check Render logs.'
+                        );
+                    }
+                }
+
+                if (
+                    command === '.ss' ||
+                    command === 'ss' ||
+                    command === '.savestatus'
+                ) {
+                    const isQuoted =
+                        type === 'extendedTextMessage' &&
+                        mek.message.extendedTextMessage
+                            .contextInfo
+                            ?.quotedMessage;
+
+                    if (isQuoted) {
+                        const quotedMsg =
+                            mek.message.extendedTextMessage
+                                .contextInfo.quotedMessage;
+
+                        let mediaType = Object.keys(quotedMsg)[0];
+
+                        if (
+                            ['imageMessage', 'videoMessage']
+                                .includes(mediaType)
+                        ) {
                             const streamType =
-                                mediaType.replace(
-                                    'Message',
-                                    ''
-                                );
-
-                            const media =
-                                targetMessage[
-                                    mediaType
-                                ];
+                                mediaType.replace('Message', '');
 
                             const stream =
                                 await downloadContentFromMessage(
-                                    media,
+                                    quotedMsg[mediaType],
                                     streamType
                                 );
 
-                            const chunks = [];
+                            let buffer = Buffer.from([]);
 
-                            for await (
-                                const chunk of stream
-                            ) {
-                                chunks.push(
+                            for await (const chunk of stream) {
+                                buffer = Buffer.concat([
+                                    buffer,
                                     chunk
-                                );
+                                ]);
                             }
 
-                            const buffer =
-                                Buffer.concat(
-                                    chunks
-                                );
-
-                            if (
-                                mediaType ===
-                                'imageMessage'
-                            ) {
-
-                                await sock.sendMessage(
-                                    botOwner,
-                                    {
-                                        image: buffer,
-                                        caption:
-                                            '🤫 *View-Once Saved*'
-                                    }
-                                );
-
-                            } else if (
-                                mediaType ===
-                                'videoMessage'
-                            ) {
-
-                                await sock.sendMessage(
-                                    botOwner,
-                                    {
-                                        video: buffer,
-                                        caption:
-                                            '🤫 *View-Once Saved*'
-                                    }
-                                );
-
-                            } else if (
-                                mediaType ===
-                                'audioMessage'
-                            ) {
-
-                                await sock.sendMessage(
-                                    botOwner,
-                                    {
-                                        audio: buffer,
-                                        mimetype:
-                                            media.mimetype ||
-                                            'audio/mp4'
-                                    }
-                                );
-
-                            } else if (
-                                mediaType ===
-                                'documentMessage'
-                            ) {
-
-                                await sock.sendMessage(
-                                    botOwner,
-                                    {
-                                        document: buffer,
-                                        mimetype:
-                                            media.mimetype ||
-                                            'application/octet-stream',
-                                        fileName:
-                                            media.fileName ||
-                                            'saved-file'
-                                    }
-                                );
+                            if (mediaType === 'imageMessage') {
+                                await sock.sendMessage(botOwner, {
+                                    image: buffer,
+                                    caption: '📲 *Status Saved!*'
+                                });
+                            } else {
+                                await sock.sendMessage(botOwner, {
+                                    video: buffer,
+                                    caption: '📲 *Status Saved!*'
+                                });
                             }
 
-                            await sock.sendMessage(
-                                from,
-                                {
-                                    react: {
-                                        text: '✅',
-                                        key: mek.key
-                                    }
+                            await sock.sendMessage(from, {
+                                react: {
+                                    text: '✅',
+                                    key: mek.key
                                 }
-                            );
-
-                        } catch (err) {
-
-                            console.error(
-                                'View Once Error:',
-                                err
-                            );
-
-                            await sendBorderStatus(
-                                '𝙑𝙄𝙀𝙒-𝙊𝙉𝘾𝙀 𝙀𝙍𝙍𝙊𝙍',
-                                'Media download failed. Check Render logs.'
-                            );
+                            });
                         }
                     }
+                }
 
-                    // =========================
-                    // SAVE STATUS
-                    // =========================
+                if (command === '.ai' || command === 'ai') {
+                    if (!qtext) {
+                        return sendBorderStatus(
+                            '𝘼𝙄 𝙀𝙍𝙍𝙊𝙍',
+                            'Please ask a question.'
+                        );
+                    }
 
-                    if (
-                        command === '.ss' ||
-                        command === 'ss' ||
-                        command === '.savestatus'
-                    ) {
+                    try {
+                        const response = await fetch(
+                            `https://api.vyture.workers.dev/?prompt=${encodeURIComponent(qtext)}`
+                        );
 
-                        const isQuoted =
-                            type ===
-                                'extendedTextMessage' &&
-                            mek.message
-                                .extendedTextMessage
+                        const data = await response.json();
+
+                        await sendBorderStatus(
+                            '𝘼𝙄 𝙕𝙊𝙉𝙀',
+                            data.result ||
+                            data.response ||
+                            "No response."
+                        );
+                    } catch (e) {
+                        await sendBorderStatus(
+                            '𝘼𝙄 𝙀𝙍𝙍𝙊𝙍',
+                            'API connection failed.'
+                        );
+                    }
+                }
+
+                if (
+                    command === '.s' ||
+                    command === '.sticker' ||
+                    command === 'sticker'
+                ) {
+                    const isQuotedImage =
+                        type === 'extendedTextMessage' &&
+                        mek.message.extendedTextMessage
+                            .contextInfo
+                            ?.quotedMessage
+                            ?.imageMessage;
+
+                    const isImage = type === 'imageMessage';
+
+                    if (isImage || isQuotedImage) {
+                        const imgMsg = isImage
+                            ? mek.message.imageMessage
+                            : mek.message.extendedTextMessage
                                 .contextInfo
-                                ?.quotedMessage;
+                                .quotedMessage
+                                .imageMessage;
 
-                        if (isQuoted) {
-
-                            const quotedMsg =
-                                mek.message
-                                    .extendedTextMessage
-                                    .contextInfo
-                                    .quotedMessage;
-
-                            let mediaType =
-                                Object.keys(
-                                    quotedMsg
-                                )[0];
-
-                            if (
-                                [
-                                    'imageMessage',
-                                    'videoMessage'
-                                ].includes(
-                                    mediaType
-                                )
-                            ) {
-
-                                const streamType =
-                                    mediaType.replace(
-                                        'Message',
-                                        ''
-                                    );
-
-                                const stream =
-                                    await downloadContentFromMessage(
-                                        quotedMsg[
-                                            mediaType
-                                        ],
-                                        streamType
-                                    );
-
-                                let buffer =
-                                    Buffer.from([]);
-
-                                for await (
-                                    const chunk of stream
-                                ) {
-
-                                    buffer =
-                                        Buffer.concat(
-                                            [
-                                                buffer,
-                                                chunk
-                                            ]
-                                        );
-                                }
-
-                                if (
-                                    mediaType ===
-                                    'imageMessage'
-                                ) {
-
-                                    await sock.sendMessage(
-                                        botOwner,
-                                        {
-                                            image: buffer,
-                                            caption:
-                                                '📲 *Status Saved!*'
-                                        }
-                                    );
-
-                                } else {
-
-                                    await sock.sendMessage(
-                                        botOwner,
-                                        {
-                                            video: buffer,
-                                            caption:
-                                                '📲 *Status Saved!*'
-                                        }
-                                    );
-                                }
-
-                                await sock.sendMessage(
-                                    from,
-                                    {
-                                        react: {
-                                            text: '✅',
-                                            key: mek.key
-                                        }
-                                    }
-                                );
-                            }
-                        }
-                    }
-
-                    // =========================
-                    // AI
-                    // =========================
-
-                    if (
-                        command === '.ai' ||
-                        command === 'ai'
-                    ) {
-
-                        if (!qtext) {
-
-                            return sendBorderStatus(
-                                '𝘼𝙄 𝙀𝙍𝙍𝙊𝙍',
-                                'Please ask a question.'
-                            );
-                        }
-
-                        try {
-
-                            const response =
-                                await fetch(
-                                    `https://api.vyture.workers.dev/?prompt=${encodeURIComponent(qtext)}`
-                                );
-
-                            const data =
-                                await response.json();
-
-                            await sendBorderStatus(
-                                '𝘼𝙄 𝙕𝙊𝙉𝙀',
-                                data.result ||
-                                data.response ||
-                                "No response."
+                        const stream =
+                            await downloadContentFromMessage(
+                                imgMsg,
+                                'image'
                             );
 
-                        } catch (e) {
+                        let buffer = Buffer.from([]);
 
-                            await sendBorderStatus(
-                                '𝘼𝙄 𝙀𝙍𝙍𝙊𝙍',
-                                'API connection failed.'
-                            );
-                        }
-                    }
-
-                    // =========================
-                    // STICKER
-                    // =========================
-
-                    if (
-                        command === '.s' ||
-                        command === '.sticker' ||
-                        command === 'sticker'
-                    ) {
-
-                        const isQuotedImage =
-                            type ===
-                                'extendedTextMessage' &&
-                            mek.message
-                                .extendedTextMessage
-                                .contextInfo
-                                ?.quotedMessage
-                                ?.imageMessage;
-
-                        const isImage =
-                            type ===
-                            'imageMessage';
-
-                        if (
-                            isImage ||
-                            isQuotedImage
-                        ) {
-
-                            const imgMsg =
-                                isImage
-                                    ? mek.message
-                                        .imageMessage
-                                    : mek.message
-                                        .extendedTextMessage
-                                        .contextInfo
-                                        .quotedMessage
-                                        .imageMessage;
-
-                            const stream =
-                                await downloadContentFromMessage(
-                                    imgMsg,
-                                    'image'
-                                );
-
-                            let buffer =
-                                Buffer.from([]);
-
-                            for await (
-                                const chunk of stream
-                            ) {
-
-                                buffer =
-                                    Buffer.concat(
-                                        [
-                                            buffer,
-                                            chunk
-                                        ]
-                                    );
-                            }
-
-                            await sock.sendMessage(
-                                from,
-                                {
-                                    sticker: buffer
-                                },
-                                {
-                                    quoted: mek
-                                }
-                            );
-                        }
-                    }
-
-                    // =========================
-                    // TAG ALL
-                    // =========================
-
-                    if (
-                        (
-                            command ===
-                                '.tagall' ||
-                            command ===
-                                'tagall'
-                        ) &&
-                        isGroup
-                    ) {
-
-                        const groupMetadata =
-                            await sock.groupMetadata(
-                                from
-                            );
-
-                        let text =
-                            `📢 *ATTENTION EVERYONE*\n\n`;
-
-                        let mentions = [];
-
-                        for (
-                            let mem of
-                            groupMetadata.participants
-                        ) {
-
-                            text +=
-                                `@${mem.id.split('@')[0]}\n`;
-
-                            mentions.push(
-                                mem.id
-                            );
+                        for await (const chunk of stream) {
+                            buffer = Buffer.concat([
+                                buffer,
+                                chunk
+                            ]);
                         }
 
                         await sock.sendMessage(
                             from,
-                            {
-                                text,
-                                mentions
-                            },
-                            {
-                                quoted: mek
-                            }
+                            { sticker: buffer },
+                            { quoted: mek }
                         );
                     }
+                }
 
-                    // =========================
-                    // PING / RUNTIME
-                    // =========================
+                if (
+                    (command === '.tagall' || command === 'tagall') &&
+                    isGroup
+                ) {
+                    const groupMetadata =
+                        await sock.groupMetadata(from);
 
-                    if (
-                        command === '.ping' ||
-                        command === 'ping' ||
-                        command === '.runtime' ||
-                        command === 'runtime'
+                    let text =
+                        `📢 *ATTENTION EVERYONE*\n\n`;
+
+                    let mentions = [];
+
+                    for (
+                        let mem of groupMetadata.participants
                     ) {
+                        text +=
+                            `@${mem.id.split('@')[0]}\n`;
 
-                        await sendBorderStatus(
-                            '𝙋𝙄𝙉𝙂 & 𝙍𝙐𝙉𝙏𝙄𝙈𝙀',
-                            `Status: Online 🟢\n       ⏳ Uptime: ${getUptime()}`
-                        );
+                        mentions.push(mem.id);
                     }
 
-                } catch (e) {
-
-                    console.error(
-                        'Processing Error:',
-                        e
+                    await sock.sendMessage(
+                        from,
+                        {
+                            text,
+                            mentions
+                        },
+                        {
+                            quoted: mek
+                        }
                     );
                 }
+
+                if (
+                    command === '.ping' ||
+                    command === 'ping' ||
+                    command === '.runtime' ||
+                    command === 'runtime'
+                ) {
+                    await sendBorderStatus(
+                        '𝙋𝙄𝙉𝙂 & 𝙍𝙐𝙉𝙏𝙄𝙈𝙀',
+                        `Status: Online 🟢\n       ⏳ Uptime: ${getUptime()}`
+                    );
+                }
+
+            } catch (e) {
+                console.error(
+                    'Processing Error:',
+                    e
+                );
             }
-        );
+        });
 
         return {
             success: true,
@@ -1098,34 +728,23 @@ async function startSession(phoneNumber, options = {}) {
         };
 
     } catch (err) {
-
         console.error(
             `startSession Error (${cleanedNumber}):`,
             err
         );
 
-        startingSessions.delete(
-            cleanedNumber
-        );
-
-        clearReconnectTimer(
-            cleanedNumber
-        );
+        startingSessions.delete(cleanedNumber);
+        clearReconnectTimer(cleanedNumber);
 
         const currentSocket =
-            activeSockets.get(
-                cleanedNumber
-            );
+            activeSockets.get(cleanedNumber);
 
         if (currentSocket) {
-
             try {
-
                 await closeSocket(
                     cleanedNumber,
                     currentSocket
                 );
-
             } catch (e) {}
         }
 
@@ -1138,295 +757,183 @@ async function startSession(phoneNumber, options = {}) {
     }
 }
 
-// =========================
-// AUTO START SESSIONS
-// =========================
 
+// Auto Start Active Sessions
 fs.readdirSync(
     SESSIONS_BASE,
-    {
-        withFileTypes: true
-    }
-).forEach(
-    (entry) => {
+    { withFileTypes: true }
+).forEach((entry) => {
+    if (!entry.isDirectory()) return;
 
-        if (!entry.isDirectory())
-            return;
+    const folder = entry.name;
 
-        const folder =
-            entry.name;
-
-        if (
-            fs.existsSync(
-                path.join(
-                    SESSIONS_BASE,
-                    folder,
-                    'creds.json'
-                )
+    if (
+        fs.existsSync(
+            path.join(
+                SESSIONS_BASE,
+                folder,
+                'creds.json'
             )
-        ) {
-
-            startSession(
-                folder
-            ).catch(
-                (err) =>
-                    console.error(
-                        `Auto-start Error (${folder}):`,
-                        err
-                    )
-            );
-        }
+        )
+    ) {
+        startSession(folder).catch((err) =>
+            console.error(
+                `Auto-start Error (${folder}):`,
+                err
+            )
+        );
     }
-);
+});
 
-// =========================
-// CONNECT API
-// =========================
 
-app.post(
-    '/connect',
-    async (req, res) => {
+// APIs
+app.post('/connect', async (req, res) => {
+    const { phone } = req.body;
 
-        const {
-            phone
-        } = req.body;
+    const cleanedNumber =
+        phone
+            ? phone.replace(/[^0-9]/g, '')
+            : '';
 
-        const cleanedNumber =
-            phone
-                ? phone.replace(
-                    /[^0-9]/g,
-                    ''
-                )
-                : '';
+    if (!cleanedNumber) {
+        return res.status(400).json({
+            success: false,
+            error: 'Invalid Phone Number'
+        });
+    }
 
-        if (!cleanedNumber) {
+    // Never delete a saved session here:
+    // the Signal keys must survive reconnects/restarts.
+    const result =
+        await startSession(cleanedNumber);
 
-            return res
-                .status(400)
-                .json({
-                    success: false,
-                    error:
-                        'Invalid Phone Number'
+    res.json(result);
+});
+
+
+app.post('/disconnect', async (req, res) => {
+    const { phone } = req.body;
+
+    const cleanedNumber =
+        phone
+            ? phone.replace(/[^0-9]/g, '')
+            : '';
+
+    if (activeSockets.has(cleanedNumber)) {
+        try {
+            const sock =
+                activeSockets.get(cleanedNumber);
+
+            sock.ev.removeAllListeners();
+
+            await sock.logout();
+
+            sock.end(undefined);
+        } catch (e) {}
+
+        activeSockets.delete(cleanedNumber);
+    }
+
+    const sessionPath =
+        `${SESSIONS_BASE}/${cleanedNumber}`;
+
+    if (fs.existsSync(sessionPath)) {
+        fs.rmSync(
+            sessionPath,
+            {
+                recursive: true,
+                force: true
+            }
+        );
+    }
+
+    res.json({
+        success: true,
+        message:
+            'Session Deleted Successfully'
+    });
+});
+
+
+app.get('/status/:phone', (req, res) => {
+    const cleanedNumber =
+        req.params.phone.replace(
+            /[^0-9]/g,
+            ''
+        );
+
+    const isConnected =
+        activeSockets.has(cleanedNumber);
+
+    const code =
+        pairingCodes.get(cleanedNumber) ||
+        null;
+
+    res.json({
+        connected: isConnected,
+        code
+    });
+});
+
+
+app.get('/admin/accounts', (req, res) => {
+    const password = req.query.pass;
+
+    if (password === ADMIN_PASSWORD) {
+        let allSessions = new Set();
+
+        activeSockets.forEach(
+            (_, key) =>
+                allSessions.add(key)
+        );
+
+        if (fs.existsSync(SESSIONS_BASE)) {
+            fs.readdirSync(SESSIONS_BASE)
+                .forEach(folder => {
+                    if (
+                        fs.existsSync(
+                            `${SESSIONS_BASE}/${folder}/creds.json`
+                        )
+                    ) {
+                        allSessions.add(folder);
+                    }
                 });
         }
 
-        const result =
-            await startSession(
-                cleanedNumber
-            );
-
-        res.json(result);
-    }
-);
-
-// =========================
-// DISCONNECT API
-// =========================
-
-app.post(
-    '/disconnect',
-    async (req, res) => {
-
-        const {
-            phone
-        } = req.body;
-
-        const cleanedNumber =
-            phone
-                ? phone.replace(
-                    /[^0-9]/g,
-                    ''
-                )
-                : '';
-
-        if (
-            activeSockets.has(
-                cleanedNumber
-            )
-        ) {
-
-            try {
-
-                const sock =
-                    activeSockets.get(
-                        cleanedNumber
-                    );
-
-                sock.ev.removeAllListeners();
-
-                await sock.logout();
-
-                sock.end(
-                    undefined
-                );
-
-            } catch (e) {}
-
-            activeSockets.delete(
-                cleanedNumber
-            );
-        }
-
-        const sessionPath =
-            `${SESSIONS_BASE}/${cleanedNumber}`;
-
-        if (
-            fs.existsSync(
-                sessionPath
-            )
-        ) {
-
-            fs.rmSync(
-                sessionPath,
-                {
-                    recursive: true,
-                    force: true
-                }
-            );
-        }
+        const accounts =
+            Array.from(allSessions)
+                .map((num) => ({
+                    phone: num,
+                    status:
+                        activeSockets.has(num)
+                            ? 'Connected 🟢'
+                            : (
+                                pairingCodes.has(num)
+                                    ? 'Pairing 🟡'
+                                    : 'Saved 📁'
+                            )
+                }));
 
         res.json({
-            success: true,
-            message:
-                'Session Deleted Successfully'
+            accounts,
+            uptime: getUptime()
+        });
+
+    } else {
+        res.status(403).json({
+            error: 'Unauthorized'
         });
     }
-);
+});
 
-// =========================
-// STATUS API
-// =========================
 
-app.get(
-    '/status/:phone',
-    (req, res) => {
-
-        const cleanedNumber =
-            req.params.phone.replace(
-                /[^0-9]/g,
-                ''
-            );
-
-        const isConnected =
-            activeSockets.has(
-                cleanedNumber
-            );
-
-        const code =
-            pairingCodes.get(
-                cleanedNumber
-            ) || null;
-
-        res.json({
-            connected:
-                isConnected,
-            code
-        });
-    }
-);
-
-// =========================
-// ADMIN API
-// =========================
-
-app.get(
-    '/admin/accounts',
-    (req, res) => {
-
-        const password =
-            req.query.pass;
-
-        if (
-            password ===
-            ADMIN_PASSWORD
-        ) {
-
-            let allSessions =
-                new Set();
-
-            activeSockets.forEach(
-                (_, key) =>
-                    allSessions.add(
-                        key
-                    )
-            );
-
-            if (
-                fs.existsSync(
-                    SESSIONS_BASE
-                )
-            ) {
-
-                fs.readdirSync(
-                    SESSIONS_BASE
-                ).forEach(
-                    folder => {
-
-                        if (
-                            fs.existsSync(
-                                `${SESSIONS_BASE}/${folder}/creds.json`
-                            )
-                        ) {
-
-                            allSessions.add(
-                                folder
-                            );
-                        }
-                    }
-                );
-            }
-
-            const accounts =
-                Array.from(
-                    allSessions
-                ).map(
-                    (num) => ({
-                        phone: num,
-                        status:
-                            activeSockets.has(
-                                num
-                            )
-                                ? 'Connected 🟢'
-                                : (
-                                    pairingCodes.has(
-                                        num
-                                    )
-                                        ? 'Pairing 🟡'
-                                        : 'Saved 📁'
-                                )
-                    })
-                );
-
-            res.json({
-                accounts,
-                uptime:
-                    getUptime()
-            });
-
-        } else {
-
-            res.status(403).json({
-                error:
-                    'Unauthorized'
-            });
-        }
-    }
-);
-
-// =========================
-// DASHBOARD
-// =========================
-
-app.get(
-    '/',
-    (req, res) => {
-
-        res.send(`
+// Dashboard UI
+app.get('/', (req, res) => {
+    res.send(`
 <!DOCTYPE html>
 <html lang="en">
 
 <head>
-
     <meta charset="UTF-8">
 
     <meta
@@ -1446,7 +953,6 @@ app.get(
     ></script>
 
     <style>
-
         :root {
             --neon-blue: #00f3ff;
             --neon-purple: #9d00ff;
@@ -1476,24 +982,19 @@ app.get(
             padding: 30px;
             background: var(--card-bg);
             border-radius: 20px;
-            border:
-                1px solid
-                rgba(0, 243, 255, 0.3);
-            box-shadow:
-                0 0 30px
-                rgba(0, 243, 255, 0.2);
+            border: 1px solid rgba(0, 243, 255, 0.3);
+            box-shadow: 0 0 30px rgba(0, 243, 255, 0.2);
             text-align: center;
         }
 
         h1 {
             font-family: 'Orbitron', sans-serif;
             font-size: 20px;
-            background:
-                linear-gradient(
-                    90deg,
-                    var(--neon-blue),
-                    var(--neon-purple)
-                );
+            background: linear-gradient(
+                90deg,
+                var(--neon-blue),
+                var(--neon-purple)
+            );
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             margin-bottom: 20px;
@@ -1504,11 +1005,8 @@ app.get(
             padding: 14px;
             margin: 12px 0;
             border-radius: 10px;
-            border:
-                1px solid
-                rgba(0,243,255,0.3);
-            background:
-                rgba(0, 0, 0, 0.6);
+            border: 1px solid rgba(0,243,255,0.3);
+            background: rgba(0, 0, 0, 0.6);
             color: #fff;
             font-size: 16px;
             outline: none;
@@ -1516,8 +1014,7 @@ app.get(
 
         .btn-grid {
             display: grid;
-            grid-template-columns:
-                1fr 1fr;
+            grid-template-columns: 1fr 1fr;
             gap: 12px;
             margin-top: 15px;
         }
@@ -1571,30 +1068,22 @@ app.get(
                     #ff5858
                 );
             color: #fff;
-            grid-column:
-                span 2;
+            grid-column: span 2;
         }
 
         .btn:hover {
-            transform:
-                scale(1.03);
+            transform: scale(1.03);
         }
 
         .code-display {
             margin-top: 20px;
             padding: 15px;
-            background:
-                rgba(0,0,0,0.9);
+            background: rgba(0,0,0,0.9);
             border-radius: 10px;
-            border:
-                1px dashed
-                var(--neon-blue);
-            font-family:
-                'Orbitron',
-                sans-serif;
+            border: 1px dashed var(--neon-blue);
+            font-family: 'Orbitron', sans-serif;
             font-size: 24px;
-            color:
-                var(--neon-blue);
+            color: var(--neon-blue);
             display: none;
         }
 
@@ -1605,16 +1094,13 @@ app.get(
             border-radius: 8px;
             margin-bottom: 8px;
             display: flex;
-            justify-content:
-                space-between;
+            justify-content: space-between;
             align-items: center;
             border:
                 1px solid
                 rgba(255,255,255,0.1);
         }
-
     </style>
-
 </head>
 
 <body>
@@ -1671,45 +1157,35 @@ app.get(
 
         <div
             id="adminPanel"
-            style="
-                display:none;
-                margin-top:20px;
-                text-align:left;
-            "
+            style="display:none; margin-top:20px; text-align:left;"
         >
 
             <h3
-                style="
-                    color:var(--neon-blue);
-                    margin-bottom:10px;
-                "
+                style="color:var(--neon-blue); margin-bottom:10px;"
             >
                 🛡️ Active Sessions
             </h3>
 
-            <div
-                id="accountsList"
-            ></div>
+            <div id="accountsList"></div>
 
         </div>
 
     </div>
 
+
     <script>
 
         let cachedAdminPass = '';
+
 
         async function connectBot() {
 
             const phone =
                 document
-                    .getElementById(
-                        'phoneNumber'
-                    )
+                    .getElementById('phoneNumber')
                     .value;
 
             if(!phone) {
-
                 return Swal.fire(
                     'Error',
                     'Enter phone number!',
@@ -1718,13 +1194,10 @@ app.get(
             }
 
             Swal.fire({
-                title:
-                    'Requesting Code...',
-                allowOutsideClick:
-                    false,
-                didOpen:
-                    () =>
-                        Swal.showLoading()
+                title: 'Requesting Code...',
+                allowOutsideClick: false,
+                didOpen: () =>
+                    Swal.showLoading()
             });
 
             try {
@@ -1733,8 +1206,7 @@ app.get(
                     await fetch(
                         '/connect',
                         {
-                            method:
-                                'POST',
+                            method: 'POST',
                             headers: {
                                 'Content-Type':
                                     'application/json'
@@ -1745,14 +1217,10 @@ app.get(
                                 })
                         }
                     )
-                    .then(
-                        r => r.json()
-                    );
+                    .then(r => r.json());
 
-                if(
-                    res.success &&
-                    res.code
-                ) {
+
+                if(res.success && res.code) {
 
                     Swal.close();
 
@@ -1768,9 +1236,7 @@ app.get(
                     display.style.display =
                         'block';
 
-                } else if(
-                    res.success
-                ) {
+                } else if(res.success) {
 
                     checkStatus();
 
@@ -1794,9 +1260,8 @@ app.get(
             }
         }
 
-        async function disconnectBot(
-            targetPhone
-        ) {
+
+        async function disconnectBot(targetPhone) {
 
             const phone =
                 targetPhone ||
@@ -1807,7 +1272,6 @@ app.get(
                     .value;
 
             if(!phone) {
-
                 return Swal.fire(
                     'Error',
                     'Enter phone number!',
@@ -1819,8 +1283,7 @@ app.get(
                 await fetch(
                     '/disconnect',
                     {
-                        method:
-                            'POST',
+                        method: 'POST',
                         headers: {
                             'Content-Type':
                                 'application/json'
@@ -1831,9 +1294,8 @@ app.get(
                             })
                     }
                 )
-                .then(
-                    r => r.json()
-                );
+                .then(r => r.json());
+
 
             if(res.success) {
 
@@ -1847,11 +1309,11 @@ app.get(
                     .getElementById(
                         'codeDisplay'
                     )
-                    .style.display =
-                    'none';
+                    .style.display = 'none';
 
-                if(cachedAdminPass)
+                if(cachedAdminPass) {
                     fetchAdminSessions();
+                }
 
             } else {
 
@@ -1863,6 +1325,7 @@ app.get(
             }
         }
 
+
         async function checkStatus() {
 
             const phone =
@@ -1873,7 +1336,6 @@ app.get(
                     .value;
 
             if(!phone) {
-
                 return Swal.fire(
                     'Error',
                     'Enter phone number!',
@@ -1883,18 +1345,17 @@ app.get(
 
             const res =
                 await fetch(
-                    '/status/' +
-                    phone
+                    '/status/' + phone
                 )
-                .then(
-                    r => r.json()
-                );
+                .then(r => r.json());
+
 
             const display =
                 document
                     .getElementById(
                         'codeDisplay'
                     );
+
 
             if(res.connected) {
 
@@ -1927,6 +1388,7 @@ app.get(
             }
         }
 
+
         async function openAdminPanel() {
 
             if(!cachedAdminPass) {
@@ -1942,14 +1404,17 @@ app.get(
                         true
                 });
 
-                if(password)
+                if (password) {
                     cachedAdminPass =
                         password;
+                }
             }
 
-            if(cachedAdminPass)
+            if(cachedAdminPass) {
                 fetchAdminSessions();
+            }
         }
+
 
         async function fetchAdminSessions() {
 
@@ -1960,14 +1425,12 @@ app.get(
                         '/admin/accounts?pass=' +
                         cachedAdminPass
                     )
-                    .then(
-                        r => r.json()
-                    );
+                    .then(r => r.json());
 
-                if(res.error) {
 
-                    cachedAdminPass =
-                        '';
+                if (res.error) {
+
+                    cachedAdminPass = '';
 
                     return Swal.fire(
                         'Denied',
@@ -1976,55 +1439,37 @@ app.get(
                     );
                 }
 
+
                 const list =
                     document
                         .getElementById(
                             'accountsList'
                         );
 
-                list.innerHTML =
-                    '';
+                list.innerHTML = '';
 
-                if(
-                    res.accounts.length ===
-                    0
-                ) {
+
+                if(res.accounts.length === 0) {
 
                     list.innerHTML =
                         '<div style="color:#aaa;">No active or saved sessions found.</div>';
                 }
 
-                /*
-                 * IMPORTANT:
-                 * No nested backticks here.
-                 * This prevents the Render
-                 * "missing ) after argument list"
-                 * syntax error.
-                 */
 
                 res.accounts.forEach(
                     acc => {
 
                         list.innerHTML +=
-                            '<div class="account-card">' +
-
-                            '<span>+' +
-                            acc.phone +
-                            ' (' +
-                            acc.status +
-                            ')</span>' +
-
-                            '<button class="btn btn-danger" ' +
-                            'style="padding:6px 12px; font-size:12px;" ' +
-                            'onclick="adminRemove(\\'' +
-                            acc.phone +
-                            '\\')">' +
-
-                            '🗑️ Delete' +
-
-                            '</button>' +
-
-                            '</div>';
+                            `<div class="account-card">
+                                <span>+${acc.phone} (${acc.status})</span>
+                                <button
+                                    class="btn btn-danger"
+                                    style="padding:6px 12px; font-size:12px;"
+                                    onclick="adminRemove('${acc.phone}')"
+                                >
+                                    🗑️ Delete
+                                </button>
+                            </div>`;
                     }
                 );
 
@@ -2045,56 +1490,41 @@ app.get(
             }
         }
 
-        async function adminRemove(
-            phone
-        ) {
+
+        async function adminRemove(phone) {
 
             Swal.fire({
-
                 title:
                     'Delete Session?',
-
                 text:
                     'Are you sure you want to delete session for +' +
                     phone +
                     '?',
-
                 icon:
                     'warning',
-
                 showCancelButton:
                     true,
-
                 confirmButtonColor:
                     '#ff0055',
-
                 confirmButtonText:
                     'Yes, Delete!'
+            })
+            .then(async (result) => {
 
-            }).then(
-                async (
-                    result
-                ) => {
-
-                    if(
-                        result.isConfirmed
-                    ) {
-
-                        await disconnectBot(
-                            phone
-                        );
-                    }
+                if (result.isConfirmed) {
+                    await disconnectBot(phone);
                 }
-            );
+
+            });
         }
 
     </script>
 
 </body>
-
 </html>
     `);
 });
+
 
 app.listen(
     PORT,
