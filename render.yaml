@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vivek-whatsapp-bot
+    env: docker
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 5000
+      - key: BOT_PORT
+        value: 4000
+      - key: NODE_ENGINE_URL
+        value: http://127.0.0.1:4000
