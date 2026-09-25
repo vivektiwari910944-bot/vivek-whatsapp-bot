@@ -9,7 +9,7 @@
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.9",
-    "edge-tts": "^1.2.3",
+    "edge-text-to-speech": "^0.1.6",
     "express": "^4.19.2",
     "pino": "^9.1.0"
   }
