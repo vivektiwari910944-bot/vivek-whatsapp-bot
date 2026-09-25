@@ -6,8 +6,7 @@ import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     downloadContentFromMessage,
-    fetchLatestBaileysVersion,
-    Browsers
+    fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -60,7 +59,7 @@ async function startSession(phoneNumber) {
         auth: state,
         version,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Updated Browser Config for Linking Fix
         printQRInTerminal: false,
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
@@ -73,7 +72,8 @@ async function startSession(phoneNumber) {
 
     if (!sock.authState.creds.registered) {
         try {
-            await new Promise((resolve) => setTimeout(resolve, 3000));
+            // Delay for socket initialization to prevent "Couldn't link device"
+            await new Promise((resolve) => setTimeout(resolve, 4000));
             generatedCode = await sock.requestPairingCode(cleanedNumber);
             pairingCodes.set(cleanedNumber, generatedCode);
             console.log(`[PAIRING CODE - ${cleanedNumber}]: ${generatedCode}`);
@@ -356,16 +356,13 @@ app.get('/status/:phone', (req, res) => {
     res.json({ connected: isConnected, code });
 });
 
-// Admin API: Lists active and saved session folders
 app.get('/admin/accounts', (req, res) => {
     const password = req.query.pass;
     if (password === ADMIN_PASSWORD) {
         let allSessions = new Set();
         
-        // Active sockets
         activeSockets.forEach((_, key) => allSessions.add(key));
         
-        // Folder check
         if (fs.existsSync(SESSIONS_BASE)) {
             fs.readdirSync(SESSIONS_BASE).forEach(folder => {
                 if(fs.existsSync(`${SESSIONS_BASE}/${folder}/creds.json`)) {
