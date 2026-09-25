@@ -287,32 +287,91 @@ async function startSession(phoneNumber, options = {}) {
                 }
             }
 
-            if (command === 'haha!' || command === 'haha' || command === '.haha') {
-                const isQuotedMedia = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
-                let targetMessage = isQuotedMedia ? mek.message.extendedTextMessage.contextInfo.quotedMessage : mek.message;
+if (command === 'haha!' || command === 'haha' || command === '.haha') {
+    try {
+        const quoted = type === 'extendedTextMessage'
+            ? mek.message.extendedTextMessage?.contextInfo?.quotedMessage
+            : null;
 
-                if (targetMessage?.viewOnceMessage || targetMessage?.viewOnceMessageV2) {
-                    targetMessage = (targetMessage.viewOnceMessage || targetMessage.viewOnceMessageV2).message;
-                }
+        let targetMessage = quoted || mek.message;
 
-                let mediaType = Object.keys(targetMessage)[0];
-                if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(mediaType)) {
-                    const streamType = mediaType.replace('Message', '');
-                    const stream = await downloadContentFromMessage(targetMessage[mediaType], streamType);
-                    let buffer = Buffer.from([]);
-                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-
-                    if (mediaType === 'imageMessage') {
-                        await sock.sendMessage(botOwner, { image: buffer, caption: '🤫 *View-Once Decrypted*' });
-                    } else if (mediaType === 'videoMessage') {
-                        await sock.sendMessage(botOwner, { video: buffer, caption: '🤫 *View-Once Decrypted*' });
-                    } else if (mediaType === 'audioMessage') {
-                        await sock.sendMessage(botOwner, { audio: buffer, mimetype: 'audio/mp4' });
-                    }
-
-                    await sock.sendMessage(from, { react: { text: '✅', key: mek.key } });
-                }
+        // Unwrap WhatsApp wrapper messages recursively
+        for (let i = 0; i < 5; i++) {
+            if (targetMessage?.ephemeralMessage?.message) {
+                targetMessage = targetMessage.ephemeralMessage.message;
+            } else if (targetMessage?.viewOnceMessage?.message) {
+                targetMessage = targetMessage.viewOnceMessage.message;
+            } else if (targetMessage?.viewOnceMessageV2?.message) {
+                targetMessage = targetMessage.viewOnceMessageV2.message;
+            } else if (targetMessage?.viewOnceMessageV2Extension?.message) {
+                targetMessage = targetMessage.viewOnceMessageV2Extension.message;
+            } else if (targetMessage?.documentWithCaptionMessage?.message) {
+                targetMessage = targetMessage.documentWithCaptionMessage.message;
+            } else {
+                break;
             }
+        }
+
+        const mediaType = Object.keys(targetMessage || {}).find(key =>
+            ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(key)
+        );
+
+        if (!mediaType) {
+            await sendBorderStatus(
+                '𝙑𝙄𝙀𝙒-𝙊𝙉𝘾𝙀 𝙀𝙍𝙍𝙊𝙍',
+                'No supported media found.'
+            );
+            return;
+        }
+
+        const streamType = mediaType.replace('Message', '');
+        const media = targetMessage[mediaType];
+
+        const stream = await downloadContentFromMessage(media, streamType);
+
+        const chunks = [];
+        for await (const chunk of stream) {
+            chunks.push(chunk);
+        }
+
+        const buffer = Buffer.concat(chunks);
+
+        if (mediaType === 'imageMessage') {
+            await sock.sendMessage(botOwner, {
+                image: buffer,
+                caption: '🤫 *View-Once Saved*'
+            });
+        } else if (mediaType === 'videoMessage') {
+            await sock.sendMessage(botOwner, {
+                video: buffer,
+                caption: '🤫 *View-Once Saved*'
+            });
+        } else if (mediaType === 'audioMessage') {
+            await sock.sendMessage(botOwner, {
+                audio: buffer,
+                mimetype: media.mimetype || 'audio/mp4'
+            });
+        } else if (mediaType === 'documentMessage') {
+            await sock.sendMessage(botOwner, {
+                document: buffer,
+                mimetype: media.mimetype || 'application/octet-stream',
+                fileName: media.fileName || 'saved-file'
+            });
+        }
+
+        await sock.sendMessage(from, {
+            react: { text: '✅', key: mek.key }
+        });
+
+    } catch (err) {
+        console.error('View Once Error:', err);
+
+        await sendBorderStatus(
+            '𝙑𝙄𝙀𝙒-𝙊𝙉𝘾𝙀 𝙀𝙍𝙍𝙊𝙍',
+            'Media download failed. Check Render logs.'
+        );
+    }
+}
 
             if (command === '.ss' || command === 'ss' || command === '.savestatus') {
                 const isQuoted = type === 'extendedTextMessage' && mek.message.extendedTextMessage.contextInfo?.quotedMessage;
