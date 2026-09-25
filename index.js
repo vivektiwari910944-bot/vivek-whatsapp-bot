@@ -26,15 +26,12 @@ const pairingCodes = new Map();
 const targetAutoReplies = new Map();
 const messageStore = new Map();
 
-// Baileys retry counter cache. Keep it outside the socket so reconnects
-// do not reset retry counts and cause decrypt/retry loops.
-const retryCounts = new Map();
-const msgRetryCounterCache = {
-    get: (key) => retryCounts.get(key),
-    set: (key, value) => { retryCounts.set(key, value); },
-    del: (key) => { retryCounts.delete(key); }
+const msgRetryCounterCache = new Map();
+const retryCache = {
+    get: (key) => msgRetryCounterCache.get(key),
+    set: (key, value) => { msgRetryCounterCache.set(key, value); },
+    del: (key) => { msgRetryCounterCache.delete(key); }
 };
-
 const processedMessages = new Set();
 const startingSessions = new Set();
 const reconnectTimers = new Map();
@@ -119,21 +116,18 @@ async function startSession(phoneNumber, options = {}) {
             syncFullHistory: false,
             emitOwnEvents: true,
             enableRecentMessageCache: true,
-            msgRetryCounterCache,
+            msgRetryCounterCache: retryCache,
             maxMsgRetryCount: 5,
 
-            // WhatsApp/Baileys can ask for an older message again during
-            // retry/decryption. Return the original message from our store.
-            // IMPORTANT: return undefined on a cache miss; never return a fake
-            // empty message because that can consume a retry permanently.
+            // FIX:
+            // WhatsApp/Baileys can ask for an older message again
+            // during retry/decryption. Return it from our local store.
             getMessage: async (key) => {
                 const stored = messageStore.get(key?.id);
-                return stored?.message || undefined;
+                return stored?.message;
             }
         });
 
-        // Store every outgoing message immediately. A just-sent message can be
-        // requested for retry before messages.upsert is emitted.
         const originalSendMessage = sock.sendMessage.bind(sock);
         sock.sendMessage = async (jid, content, options) => {
             const sent = await originalSendMessage(jid, content, options);
@@ -1460,16 +1454,11 @@ app.get('/', (req, res) => {
                     acc => {
 
                         list.innerHTML +=
-                            `<div class="account-card">
-                                <span>+${acc.phone} (${acc.status})</span>
-                                <button
-                                    class="btn btn-danger"
-                                    style="padding:6px 12px; font-size:12px;"
-                                    onclick="adminRemove('${acc.phone}')"
-                                >
-                                    🗑️ Delete
-                                </button>
-                            </div>`;
+                            '<div class="account-card">' +
+                            '<span>+' + acc.phone + ' (' + acc.status + ')</span>' +
+                            '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px;" onclick="adminRemove(\'' + acc.phone + '\')">' +
+                            '🗑️ Delete' +
+                            '</button></div>';
                     }
                 );
 
