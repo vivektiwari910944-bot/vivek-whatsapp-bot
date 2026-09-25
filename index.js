@@ -439,6 +439,24 @@ if (command === 'haha!' || command === 'haha' || command === '.haha') {
     });
 
     return { success: true, code: generatedCode };
+
+    } catch (err) {
+        console.error(`startSession Error (${cleanedNumber}):`, err);
+        startingSessions.delete(cleanedNumber);
+        clearReconnectTimer(cleanedNumber);
+
+        const currentSocket = activeSockets.get(cleanedNumber);
+        if (currentSocket) {
+            try {
+                await closeSocket(cleanedNumber, currentSocket);
+            } catch (e) {}
+        }
+
+        return {
+            success: false,
+            error: err?.message || 'Failed to start session.'
+        };
+    }
 }
 
 // Auto Start Active Sessions
